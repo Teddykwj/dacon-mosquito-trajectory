@@ -1,3 +1,6 @@
+import logging
+import sys
+from datetime import datetime
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -13,6 +16,17 @@ SAMPLE_SUB = DATA_DIR / "sample_submission.csv"
 
 DT      = 0.04   # 40 ms
 HORIZON = 2      # 2 steps → +80 ms
+
+
+# ── Logger (stdout only — Docker captures via `docker-compose logs`) ───────────
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("mosquito")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(fmt)
+    logger.addHandler(handler)
+    return logger
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -96,30 +110,31 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    log = setup_logger()
+    log.info("=" * 50)
+    log.info("모기 비행 궤적 예측 시작")
+    log.info("=" * 50)
+
     train_ids, train_data = load_dir(TRAIN_DIR)
     test_ids,  test_data  = load_dir(TEST_DIR)
+    log.info(f"Train 샘플: {len(train_data)}개  |  Test 샘플: {len(test_data)}개")
 
     labels   = pd.read_csv(LABELS_CSV, index_col='id')
     true_xyz = labels.loc[train_ids, ['x', 'y', 'z']].values
 
-    # 타깃: 절대 좌표가 아니라 t=0 대비 변화량 (delta)
-    # → 환경이 달라도 운동 패턴만 학습
     last_pos_train = np.array([t[-1] for t in train_data])
-    delta_train    = true_xyz - last_pos_train          # (N, 3)
+    delta_train    = true_xyz - last_pos_train
 
     X_train = build_features(train_data)
     X_test  = build_features(test_data)
-
-    print(f"Train: {X_train.shape},  Test: {X_test.shape}")
-    print(f"Feature dim: {X_train.shape[1]}")
+    log.info(f"Feature dim: {X_train.shape[1]}")
 
     # ── 기준선 성능 ────────────────────────────────────────────────────────────
     cv_preds = np.array([predict_cv_last(t) for t in train_data])
-    print(f"\nCV-last  R-Hit={r_hit(cv_preds, true_xyz):.4f}  "
-          f"MeanDist={mean_dist_cm(cv_preds, true_xyz):.2f}cm")
+    log.info(f"[CV-last]   R-Hit={r_hit(cv_preds, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(cv_preds, true_xyz):.2f}cm")
 
     # ── XGBoost 학습 ───────────────────────────────────────────────────────────
-    # 각 축(x, y, z)을 독립적으로 예측
     xgb_params = dict(
         n_estimators=500,
         max_depth=6,
@@ -130,25 +145,26 @@ def main():
         random_state=42,
         n_jobs=-1,
     )
+    log.info(f"XGBoost 학습 시작  params={xgb_params}")
 
     model = MultiOutputRegressor(XGBRegressor(**xgb_params), n_jobs=3)
     model.fit(X_train, delta_train)
+    log.info("XGBoost 학습 완료")
 
-    # 학습 데이터 성능 (과적합 확인용)
     delta_pred_train = model.predict(X_train)
     xgb_preds_train  = last_pos_train + delta_pred_train
-    print(f"XGB-train  R-Hit={r_hit(xgb_preds_train, true_xyz):.4f}  "
-          f"MeanDist={mean_dist_cm(xgb_preds_train, true_xyz):.2f}cm")
+    log.info(f"[XGB-train] R-Hit={r_hit(xgb_preds_train, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(xgb_preds_train, true_xyz):.2f}cm  (과적합 참고용)")
 
-    # ── 샘플별 상세 ────────────────────────────────────────────────────────────
-    print(f"\n{'Sample':<14} {'CV-last':>10} {'XGB':>10}")
-    print("-" * 36)
-    for i, tid in enumerate(train_ids):
+    # ── 실패 샘플 요약 (XGB 기준 오차 상위 10개만) ────────────────────────────
+    dists_xgb = np.linalg.norm(xgb_preds_train - true_xyz, axis=1) * 100
+    top_fail_idx = np.argsort(dists_xgb)[::-1][:10]
+    log.info("-" * 50)
+    log.info("XGB 오차 상위 10개 샘플:")
+    for i in top_fail_idx:
         d_cv  = np.linalg.norm(cv_preds[i] - true_xyz[i]) * 100
-        d_xgb = np.linalg.norm(xgb_preds_train[i] - true_xyz[i]) * 100
-        m_cv  = "✓" if d_cv  <= 1.0 else "✗"
-        m_xgb = "✓" if d_xgb <= 1.0 else "✗"
-        print(f"{tid:<14} {m_cv}{d_cv:>7.2f}cm  {m_xgb}{d_xgb:>7.2f}cm")
+        d_xgb = dists_xgb[i]
+        log.info(f"  {train_ids[i]}  CV={d_cv:.2f}cm  XGB={d_xgb:.2f}cm")
 
     # ── 테스트 예측 및 제출 ────────────────────────────────────────────────────
     delta_pred_test = model.predict(X_test)
@@ -163,9 +179,12 @@ def main():
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
 
-    out_sub = Path("submission_xgb.csv")
+    out_dir = Path("output")
+    out_dir.mkdir(exist_ok=True)
+    out_sub = out_dir / "submission_xgb.csv"
     sub.to_csv(out_sub, index=False)
-    print(f"\n제출 파일 → {out_sub}")
+    log.info(f"제출 파일 저장 → {out_sub}")
+    log.info("완료")
 
 
 if __name__ == '__main__':

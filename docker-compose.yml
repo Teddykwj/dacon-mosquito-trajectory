@@ -3,6 +3,5 @@ services:
     build: .
     volumes:
       - ./data:/app/data
-      - ./logs:/app/logs
-      - ./:/app/submissions
+      - ./output:/app/output
     working_dir: /app
