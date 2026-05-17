@@ -1,0 +1,8 @@
+services:
+  mosquito:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./:/app/submissions
+    working_dir: /app
