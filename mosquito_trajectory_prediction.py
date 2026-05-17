@@ -1,12 +1,13 @@
 import logging
 import os
 import sys
-from datetime import datetime
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from xgboost import XGBRegressor
-from sklearn.multioutput import MultiOutputRegressor
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 DATA_DIR   = Path("data")
@@ -15,8 +16,10 @@ TEST_DIR   = DATA_DIR / "test"
 LABELS_CSV = DATA_DIR / "train_labels.csv"
 SAMPLE_SUB = DATA_DIR / "sample_submission.csv"
 
-DT      = 0.04   # 40 ms
-HORIZON = 2      # 2 steps → +80 ms
+DT      = 0.04
+HORIZON = 2
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ── Logger ─────────────────────────────────────────────────────────────────────
@@ -52,130 +55,193 @@ def batch_cv_last(data: list[np.ndarray]) -> np.ndarray:
     return np.array([predict_cv_last(t) for t in data])
 
 
-# ── Feature engineering ────────────────────────────────────────────────────────
-def extract_features(traj: np.ndarray, cv_pred: np.ndarray) -> np.ndarray:
+# ── Dataset ────────────────────────────────────────────────────────────────────
+class TrajectoryDataset(Dataset):
     """
-    v3: CV-last 예측값을 피처로 추가
-    → XGBoost가 CV-last의 보정량(잔차)을 학습하도록 앵커 역할
+    입력: 속도 시계열 (10, 3) — 절대 좌표 대신 상대 운동만 사용
+    타깃: CV-last 대비 잔차 (3,)
     """
-    vels  = np.diff(traj, axis=0) / DT   # (10, 3)
-    accs  = np.diff(vels, axis=0) / DT   # (9, 3)
+    def __init__(self, data: list[np.ndarray], cv_preds: np.ndarray,
+                 residuals: np.ndarray | None = None):
+        self.vels      = np.array([np.diff(t, axis=0) / DT for t in data],
+                                  dtype=np.float32)   # (N, 10, 3)
+        self.cv_delta  = (cv_preds - np.array([t[-1] for t in data])).astype(np.float32)
+        self.residuals = residuals.astype(np.float32) if residuals is not None else None
 
-    feats = []
+    def __len__(self):
+        return len(self.vels)
 
-    # 절대 위치 (v1에서 유효했음)
-    feats.append(traj[-1])                             # (3,)
-
-    # CV-last 예측 delta (잔차 학습의 앵커)
-    feats.append(cv_pred - traj[-1])                   # (3,)
-
-    # 속도 시계열 전체 (10 x 3 = 30)
-    feats.append(vels.flatten())
-
-    # 가속도 시계열 전체 (9 x 3 = 27)
-    feats.append(accs.flatten())
-
-    # 속도 통계
-    feats.append(vels.mean(axis=0))
-    feats.append(vels.std(axis=0))
-
-    # 최근 속도 vs 전체 평균
-    recent_vel = vels[-3:].mean(axis=0)
-    feats.append(recent_vel)
-    feats.append(recent_vel - vels.mean(axis=0))
-
-    # 가속도 통계
-    feats.append(accs.mean(axis=0))
-    feats.append(accs[-3:].mean(axis=0))
-
-    # 전체 변위
-    feats.append(traj[-1] - traj[0])
-
-    # 속력
-    speeds = np.linalg.norm(vels, axis=1)
-    feats.append(speeds)
-    feats.append(np.array([speeds.mean(), speeds.std(), speeds[-1]]))
-
-    return np.concatenate(feats)
+    def __getitem__(self, idx):
+        x = self.vels[idx]                            # (10, 3)
+        cv = self.cv_delta[idx]                       # (3,)
+        if self.residuals is not None:
+            return x, cv, self.residuals[idx]
+        return x, cv
 
 
-def build_features(data: list[np.ndarray], cv_preds: np.ndarray) -> np.ndarray:
-    return np.array([extract_features(t, cv) for t, cv in zip(data, cv_preds)])
+# ── Model ──────────────────────────────────────────────────────────────────────
+class MosquitoLSTM(nn.Module):
+    """
+    속도 시계열 → LSTM → 잔차 예측
+    CV-last delta를 FC 입력에 concat → 보정 방향 앵커
+    """
+    def __init__(self, hidden: int = 128, layers: int = 2, dropout: float = 0.3):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=3,
+            hidden_size=hidden,
+            num_layers=layers,
+            batch_first=True,
+            dropout=dropout if layers > 1 else 0.0,
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(hidden + 3, 64),   # +3 for cv_delta
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3),
+        )
+
+    def forward(self, vels, cv_delta):
+        _, (h, _) = self.lstm(vels)
+        h_last = h[-1]                                # (batch, hidden)
+        x = torch.cat([h_last, cv_delta], dim=1)     # (batch, hidden+3)
+        return self.fc(x)
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
-def r_hit(preds: np.ndarray, trues: np.ndarray, threshold: float = 0.01) -> float:
-    return float(np.mean(np.linalg.norm(preds - trues, axis=1) <= threshold))
+def r_hit(preds: np.ndarray, trues: np.ndarray) -> float:
+    return float(np.mean(np.linalg.norm(preds - trues, axis=1) <= 0.01))
 
 
 def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(preds - trues, axis=1)) * 100)
 
 
+# ── Train / Eval ───────────────────────────────────────────────────────────────
+def train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total = 0.0
+    for vels, cv_delta, target in loader:
+        vels, cv_delta, target = vels.to(DEVICE), cv_delta.to(DEVICE), target.to(DEVICE)
+        optimizer.zero_grad()
+        pred = model(vels, cv_delta)
+        loss = criterion(pred, target)
+        loss.backward()
+        optimizer.step()
+        total += loss.item() * len(vels)
+    return total / len(loader.dataset)
+
+
+@torch.no_grad()
+def predict(model, loader):
+    model.eval()
+    preds = []
+    for batch in loader:
+        vels, cv_delta = batch[0].to(DEVICE), batch[1].to(DEVICE)
+        preds.append(model(vels, cv_delta).cpu().numpy())
+    return np.concatenate(preds)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 50)
-    log.info("모기 비행 궤적 예측 v3 (잔차 학습)")
+    log.info(f"모기 비행 궤적 예측 v4 (LSTM 잔차학습)  device={DEVICE}")
     log.info("=" * 50)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
     test_ids,  test_data  = load_dir(TEST_DIR)
-    log.info(f"Train 샘플: {len(train_data)}개  |  Test 샘플: {len(test_data)}개")
+    log.info(f"Train: {len(train_data)}개  |  Test: {len(test_data)}개")
 
     labels   = pd.read_csv(LABELS_CSV, index_col='id')
     true_xyz = labels.loc[train_ids, ['x', 'y', 'z']].values
 
-    # ── CV-last 기준선 ─────────────────────────────────────────────────────────
+    # CV-last 기준선
     cv_preds_train = batch_cv_last(train_data)
     cv_preds_test  = batch_cv_last(test_data)
     log.info(f"[CV-last]  R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    # ── 피처 / 타깃 구성 ───────────────────────────────────────────────────────
-    X_train = build_features(train_data, cv_preds_train)
-    X_test  = build_features(test_data,  cv_preds_test)
-    log.info(f"Feature dim: {X_train.shape[1]}")
+    # 잔차 타깃
+    residuals_train = (true_xyz - cv_preds_train).astype(np.float32)
 
-    # 타깃: CV-last 대비 잔차 (delta → residual)
-    residual_train = true_xyz - cv_preds_train
-    log.info(f"Residual 크기: mean={np.linalg.norm(residual_train, axis=1).mean()*100:.2f}cm  "
-             f"std={np.linalg.norm(residual_train, axis=1).std()*100:.2f}cm")
+    # Train / Val 분리 (80 / 20)
+    n = len(train_data)
+    val_size = int(n * 0.2)
+    idx = np.random.RandomState(42).permutation(n)
+    tr_idx, val_idx = idx[val_size:], idx[:val_size]
 
-    # ── XGBoost 학습 ───────────────────────────────────────────────────────────
-    xgb_params = dict(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=3,
-        random_state=42,
-        n_jobs=-1,
-    )
-    log.info(f"XGBoost 학습 시작  params={xgb_params}")
+    tr_data  = [train_data[i] for i in tr_idx]
+    val_data = [train_data[i] for i in val_idx]
+    tr_cv    = cv_preds_train[tr_idx]
+    val_cv   = cv_preds_train[val_idx]
+    tr_res   = residuals_train[tr_idx]
+    val_res  = residuals_train[val_idx]
+    val_true = true_xyz[val_idx]
 
-    model = MultiOutputRegressor(XGBRegressor(**xgb_params), n_jobs=3)
-    model.fit(X_train, residual_train)
-    log.info("XGBoost 학습 완료")
+    tr_ds  = TrajectoryDataset(tr_data,  tr_cv,  tr_res)
+    val_ds = TrajectoryDataset(val_data, val_cv, val_res)
+    test_ds = TrajectoryDataset(test_data, cv_preds_test)
 
-    # 최종 예측 = CV-last + 잔차 보정
-    residual_pred_train = model.predict(X_train)
-    final_preds_train   = cv_preds_train + residual_pred_train
-    log.info(f"[XGB-v3-train] R-Hit={r_hit(final_preds_train, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(final_preds_train, true_xyz):.2f}cm  (과적합 참고용)")
+    tr_loader   = DataLoader(tr_ds,   batch_size=256, shuffle=True,  num_workers=0)
+    val_loader  = DataLoader(val_ds,  batch_size=512, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=0)
 
-    # ── 오차 상위 10개 ─────────────────────────────────────────────────────────
-    dists = np.linalg.norm(final_preds_train - true_xyz, axis=1) * 100
-    log.info("-" * 50)
-    log.info("오차 상위 10개:")
-    for i in np.argsort(dists)[::-1][:10]:
-        log.info(f"  {train_ids[i]}  CV={np.linalg.norm(cv_preds_train[i]-true_xyz[i])*100:.2f}cm  "
-                 f"XGB={dists[i]:.2f}cm")
+    # 모델
+    model = MosquitoLSTM(hidden=128, layers=2, dropout=0.3).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    criterion = nn.HuberLoss(delta=0.005)   # 1cm 스케일에 맞춘 delta
 
-    # ── 제출 파일 ──────────────────────────────────────────────────────────────
-    residual_pred_test = model.predict(X_test)
-    final_preds_test   = cv_preds_test + residual_pred_test
+    log.info(f"파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
+
+    # 학습
+    best_val_rhit = 0.0
+    best_state    = None
+    patience      = 30
+    no_improve    = 0
+
+    for epoch in range(1, 201):
+        tr_loss = train_epoch(model, tr_loader, optimizer, criterion)
+        scheduler.step()
+
+        if epoch % 10 == 0 or epoch == 1:
+            val_res_pred = predict(model, val_loader)
+            val_preds    = val_cv + val_res_pred
+            val_rhit     = r_hit(val_preds, val_true)
+            val_dist     = mean_dist_cm(val_preds, val_true)
+            lr_now       = scheduler.get_last_lr()[0]
+            log.info(f"Epoch {epoch:3d}  loss={tr_loss:.6f}  "
+                     f"val R-Hit={val_rhit:.4f}  val dist={val_dist:.2f}cm  lr={lr_now:.5f}")
+
+            if val_rhit > best_val_rhit:
+                best_val_rhit = val_rhit
+                best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                no_improve    = 0
+            else:
+                no_improve += 10
+
+            if no_improve >= patience:
+                log.info(f"Early stopping at epoch {epoch}  best val R-Hit={best_val_rhit:.4f}")
+                break
+
+    # 최적 모델로 복구
+    model.load_state_dict(best_state)
+
+    # Train 전체 성능
+    tr_all_ds     = TrajectoryDataset(train_data, cv_preds_train, residuals_train)
+    tr_all_loader = DataLoader(tr_all_ds, batch_size=512, shuffle=False, num_workers=0)
+    tr_res_pred   = predict(model, tr_all_loader)
+    tr_final      = cv_preds_train + tr_res_pred
+    log.info(f"[LSTM-train] R-Hit={r_hit(tr_final, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(tr_final, true_xyz):.2f}cm  (과적합 참고용)")
+    log.info(f"[LSTM-val]   R-Hit={best_val_rhit:.4f}  (best)")
+
+    # 제출
+    test_res_pred = predict(model, test_loader)
+    final_preds_test = cv_preds_test + test_res_pred
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_preds_test)}
@@ -187,10 +253,8 @@ def main():
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    out_sub = out_dir / "submission_xgb_v3.csv"
+    out_sub = out_dir / "submission_lstm_v4.csv"
     sub.to_csv(out_sub, index=False)
-
-    # 컨테이너가 root로 실행되므로 호스트에서 삭제 가능하도록 권한 개방
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
 

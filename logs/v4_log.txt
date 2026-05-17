@@ -1,0 +1,47 @@
+docker compose up --build
+w Enable Watch   d Detach
+[+] Building 48.6s (14/14) FINISHED                       
+ => [internal] load local bake definitions           0.0s
+ => => reading from stdin 488B                       0.0s
+ => [internal] load build definition from dockerfil  0.0s
+ => => transferring dockerfile: 371B                 0.0s
+ => [internal] load metadata for docker.io/library/  0.0s
+ => [internal] load .dockerignore                    0.0s
+ => => transferring context: 2B                      0.0s
+ => [1/7] FROM docker.io/library/python:3.11-slim    0.0s
+ => [internal] load build context                    0.4s
+ => => transferring context: 911.62kB                0.3s
+ => CACHED [2/7] WORKDIR /app                        0.0s
+ => CACHED [3/7] COPY requirements.txt .             0.0s
+ => [4/7] RUN pip install --no-cache-dir torch --i  19.0s
+ => [5/7] RUN pip install --no-cache-dir -r requir  21.0s 
+ => [6/7] COPY . .                                   1.3s 
+ => [7/7] RUN mkdir -p /app/logs /app/output && chm  0.2s 
+ => exporting to image                               6.6s 
+ => => exporting layers                              6.6s 
+ => => writing image sha256:f9a3a23979084fcb0629c45  0.0s 
+ => => naming to docker.io/library/test-mosquito     0.0s 
+ => resolving provenance for metadata file           0.0s
+[+] up 2/2
+ ✔ Image test-mosquito       Built                  48.7s 
+ ✔ Container test-mosquito-1 Recreated               0.1s 
+Attaching to mosquito-1
+mosquito-1  | 14:11:37  ==================================================
+mosquito-1  | 14:11:37  모기 비행 궤적 예측 v4 (LSTM 잔차 학습)  device=cpu
+mosquito-1  | 14:11:37  ==================================================
+mosquito-1  | 14:11:41  Train: 10000개  |  Test: 10000개
+mosquito-1  | 14:11:41  [CV-last]  R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 14:11:41  파라미터 수: 210,819
+mosquito-1  | 14:11:43  Epoch   1  loss=0.000242  val R-Hit=0.2025  val dist=1.78cm  lr=0.00100
+mosquito-1  | 14:11:54  Epoch  10  loss=0.000023  val R-Hit=0.5950  val dist=1.28cm  lr=0.00099
+mosquito-1  | 14:12:07  Epoch  20  loss=0.000023  val R-Hit=0.5945  val dist=1.27cm  lr=0.00098
+mosquito-1  | 14:12:19  Epoch  30  loss=0.000023  val R-Hit=0.5965  val dist=1.27cm  lr=0.00095
+mosquito-1  | 14:12:31  Epoch  40  loss=0.000023  val R-Hit=0.5930  val dist=1.27cm  lr=0.00090
+mosquito-1  | 14:12:43  Epoch  50  loss=0.000023  val R-Hit=0.5945  val dist=1.27cm  lr=0.00085
+mosquito-1  | 14:12:56  Epoch  60  loss=0.000023  val R-Hit=0.5930  val dist=1.28cm  lr=0.00079
+mosquito-1  | 14:12:56  Early stopping at epoch 60  best val R-Hit=0.5965
+mosquito-1  | 14:12:57  [LSTM-train] R-Hit=0.5821  MeanDist=1.29cm  (과적합 참고용)
+mosquito-1  | 14:12:57  [LSTM-val]   R-Hit=0.5965  (best)
+mosquito-1  | 14:12:57  제출 파일 저장 → output/submission_lstm_v4.csv
+mosquito-1  | 14:12:57  완료
+mosquito-1 exited with code 0
