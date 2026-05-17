@@ -1,5 +1,24 @@
 # Changelog
 
+## v6 (2026-05-18)
+
+### 모델
+- BiLSTM + 잔차학습 (v5 구조 유지)
+
+### 피처 변경
+- `make_seq_features`: turn_cos 추가 → (10, 9)
+- `make_global_features`: 18 → 29개
+  - turn_cos 통계 (mean/std/min/last) — 방향 전환 패턴
+  - 속력 변화율 통계 (mean/std) — 가감속 추세
+  - 마지막 속도 단위벡터 (3) — 방향 정보 명시
+  - CV-delta vs 마지막 속도 정렬도 (1)
+  - 속력 선형 기울기 (1)
+
+### 결과
+- Dacon Public: 0.6044 (v5 대비 +0.0012, v3 XGBoost 0.6090 미달)
+
+---
+
 ## v3 (2026-05-17)
 
 ### 모델

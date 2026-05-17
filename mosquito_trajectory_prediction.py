@@ -27,9 +27,15 @@ def setup_logger() -> logging.Logger:
     logger = logging.getLogger("mosquito")
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(fmt)
-    logger.addHandler(handler)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    fh = logging.FileHandler(log_dir / "v6_log.txt", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
     return logger
 
 
@@ -55,58 +61,134 @@ def batch_cv_last(data: list[np.ndarray]) -> np.ndarray:
     return np.array([predict_cv_last(t) for t in data])
 
 
+# ── Feature engineering helpers ────────────────────────────────────────────────
+def _turn_cos(vels: np.ndarray) -> np.ndarray:
+    """Cosine similarity between consecutive velocity vectors. (10,)"""
+    eps = 1e-8
+    norms = np.linalg.norm(vels, axis=1)  # (10,)
+    cos = np.zeros(len(vels))
+    for i in range(1, len(vels)):
+        denom = norms[i] * norms[i - 1] + eps
+        cos[i] = np.dot(vels[i], vels[i - 1]) / denom
+    return cos
+
+
+def make_seq_features(traj: np.ndarray) -> np.ndarray:
+    """
+    LSTM 입력: (10, 9) per-timestep 시퀀스
+    [vx, vy, vz, ax, ay, az, speed, acc_mag, turn_cos]
+    """
+    vels  = np.diff(traj, axis=0) / DT            # (10, 3)
+    accs  = np.diff(vels, axis=0) / DT             # (9, 3)
+    accs  = np.vstack([np.zeros((1, 3)), accs])    # (10, 3)
+
+    speed    = np.linalg.norm(vels, axis=1, keepdims=True)   # (10, 1)
+    acc_mag  = np.linalg.norm(accs, axis=1, keepdims=True)   # (10, 1)
+    turn_cos = _turn_cos(vels).reshape(-1, 1)                 # (10, 1)
+
+    return np.concatenate([vels, accs, speed, acc_mag, turn_cos], axis=1).astype(np.float32)  # (10, 9)
+
+
+def make_global_features(traj: np.ndarray, cv_pred: np.ndarray) -> np.ndarray:
+    """
+    FC에 concat되는 글로벌 피처 (29,)
+    """
+    vels  = np.diff(traj, axis=0) / DT    # (10, 3)
+    accs  = np.diff(vels, axis=0) / DT    # (9, 3)
+    speed = np.linalg.norm(vels, axis=1)  # (10,)
+
+    recent_vel  = vels[-3:].mean(axis=0)
+    overall_vel = vels.mean(axis=0)
+
+    # turn angle stats (4)
+    turn_cos      = _turn_cos(vels)       # (10,)
+    turn_mean     = turn_cos[1:].mean()
+    turn_std      = turn_cos[1:].std()
+    turn_min      = turn_cos[1:].min()
+    turn_last     = turn_cos[-1]
+
+    # speed change rate stats (2)
+    speed_delta   = np.diff(speed)        # (9,)
+    spd_chg_mean  = speed_delta.mean()
+    spd_chg_std   = speed_delta.std()
+
+    # last velocity unit vector (3)
+    last_vel_norm = np.linalg.norm(vels[-1]) + 1e-8
+    last_vel_unit = vels[-1] / last_vel_norm
+
+    # CV-delta alignment with last velocity direction (1)
+    cv_delta      = cv_pred - traj[-1]
+    cv_delta_norm = np.linalg.norm(cv_delta) + 1e-8
+    cv_align      = np.dot(cv_delta / cv_delta_norm, last_vel_unit)
+
+    # speed slope — linear fit over all 10 steps (1)
+    t_idx         = np.arange(len(speed))
+    speed_slope   = float(np.polyfit(t_idx, speed, 1)[0])
+
+    feats = np.concatenate([
+        cv_delta,                                          # CV-last delta (3)
+        recent_vel - overall_vel,                          # 최근 방향 전환 세기 (3)
+        accs[-3:].mean(axis=0),                            # 최근 가속도 (3)
+        accs.std(axis=0),                                  # 가속도 변동성 (3)
+        [speed.mean(), speed.std(), speed[-1]],            # 속력 통계 (3)
+        traj[-1] - traj[0],                                # 전체 변위 (3)
+        [turn_mean, turn_std, turn_min, turn_last],        # 방향 전환 통계 (4)
+        [spd_chg_mean, spd_chg_std],                       # 속력 변화율 통계 (2)
+        last_vel_unit,                                     # 마지막 속도 단위벡터 (3)
+        [cv_align],                                        # CV-delta 정렬도 (1)
+        [speed_slope],                                     # 속력 기울기 (1)
+    ])
+    return feats.astype(np.float32)  # (29,)
+
+
 # ── Dataset ────────────────────────────────────────────────────────────────────
 class TrajectoryDataset(Dataset):
-    """
-    입력: 속도 시계열 (10, 3) — 절대 좌표 대신 상대 운동만 사용
-    타깃: CV-last 대비 잔차 (3,)
-    """
     def __init__(self, data: list[np.ndarray], cv_preds: np.ndarray,
                  residuals: np.ndarray | None = None):
-        self.vels      = np.array([np.diff(t, axis=0) / DT for t in data],
-                                  dtype=np.float32)   # (N, 10, 3)
-        self.cv_delta  = (cv_preds - np.array([t[-1] for t in data])).astype(np.float32)
-        self.residuals = residuals.astype(np.float32) if residuals is not None else None
+        self.seq     = np.array([make_seq_features(t) for t in data])        # (N, 10, 9)
+        self.global_ = np.array([make_global_features(t, cv)
+                                  for t, cv in zip(data, cv_preds)])          # (N, 29)
+        self.res     = residuals.astype(np.float32) if residuals is not None else None
 
     def __len__(self):
-        return len(self.vels)
+        return len(self.seq)
 
     def __getitem__(self, idx):
-        x = self.vels[idx]                            # (10, 3)
-        cv = self.cv_delta[idx]                       # (3,)
-        if self.residuals is not None:
-            return x, cv, self.residuals[idx]
-        return x, cv
+        if self.res is not None:
+            return self.seq[idx], self.global_[idx], self.res[idx]
+        return self.seq[idx], self.global_[idx]
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
-class MosquitoLSTM(nn.Module):
-    """
-    속도 시계열 → LSTM → 잔차 예측
-    CV-last delta를 FC 입력에 concat → 보정 방향 앵커
-    """
-    def __init__(self, hidden: int = 128, layers: int = 2, dropout: float = 0.3):
+class MosquitoBiLSTM(nn.Module):
+    def __init__(self, seq_dim: int = 9, global_dim: int = 29,
+                 hidden: int = 128, layers: int = 2, dropout: float = 0.3):
         super().__init__()
         self.lstm = nn.LSTM(
-            input_size=3,
+            input_size=seq_dim,
             hidden_size=hidden,
             num_layers=layers,
             batch_first=True,
+            bidirectional=True,
             dropout=dropout if layers > 1 else 0.0,
         )
+        lstm_out = hidden * 2
         self.fc = nn.Sequential(
-            nn.Linear(hidden + 3, 64),   # +3 for cv_delta
+            nn.Linear(lstm_out + global_dim, 128),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 32),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(32, 3),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(64, 3),
         )
 
-    def forward(self, vels, cv_delta):
-        _, (h, _) = self.lstm(vels)
-        h_last = h[-1]                                # (batch, hidden)
-        x = torch.cat([h_last, cv_delta], dim=1)     # (batch, hidden+3)
+    def forward(self, seq, global_feat):
+        _, (h, _) = self.lstm(seq)
+        h_fwd = h[-2]
+        h_bwd = h[-1]
+        h_cat = torch.cat([h_fwd, h_bwd], dim=1)
+        x = torch.cat([h_cat, global_feat], dim=1)
         return self.fc(x)
 
 
@@ -119,18 +201,18 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(preds - trues, axis=1)) * 100)
 
 
-# ── Train / Eval ───────────────────────────────────────────────────────────────
+# ── Train / Predict ────────────────────────────────────────────────────────────
 def train_epoch(model, loader, optimizer, criterion):
     model.train()
     total = 0.0
-    for vels, cv_delta, target in loader:
-        vels, cv_delta, target = vels.to(DEVICE), cv_delta.to(DEVICE), target.to(DEVICE)
+    for seq, glo, target in loader:
+        seq, glo, target = seq.to(DEVICE), glo.to(DEVICE), target.to(DEVICE)
         optimizer.zero_grad()
-        pred = model(vels, cv_delta)
-        loss = criterion(pred, target)
+        loss = criterion(model(seq, glo), target)
         loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        total += loss.item() * len(vels)
+        total += loss.item() * len(seq)
     return total / len(loader.dataset)
 
 
@@ -139,8 +221,8 @@ def predict(model, loader):
     model.eval()
     preds = []
     for batch in loader:
-        vels, cv_delta = batch[0].to(DEVICE), batch[1].to(DEVICE)
-        preds.append(model(vels, cv_delta).cpu().numpy())
+        seq, glo = batch[0].to(DEVICE), batch[1].to(DEVICE)
+        preds.append(model(seq, glo).cpu().numpy())
     return np.concatenate(preds)
 
 
@@ -148,7 +230,7 @@ def predict(model, loader):
 def main():
     log = setup_logger()
     log.info("=" * 50)
-    log.info(f"모기 비행 궤적 예측 v4 (LSTM 잔차학습)  device={DEVICE}")
+    log.info(f"모기 비행 궤적 예측 v6 (BiLSTM + FE 강화)  device={DEVICE}")
     log.info("=" * 50)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -158,50 +240,50 @@ def main():
     labels   = pd.read_csv(LABELS_CSV, index_col='id')
     true_xyz = labels.loc[train_ids, ['x', 'y', 'z']].values
 
-    # CV-last 기준선
     cv_preds_train = batch_cv_last(train_data)
     cv_preds_test  = batch_cv_last(test_data)
     log.info(f"[CV-last]  R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    # 잔차 타깃
     residuals_train = (true_xyz - cv_preds_train).astype(np.float32)
 
-    # Train / Val 분리 (80 / 20)
+    # Train / Val 분리
     n = len(train_data)
-    val_size = int(n * 0.2)
     idx = np.random.RandomState(42).permutation(n)
-    tr_idx, val_idx = idx[val_size:], idx[:val_size]
+    val_n   = int(n * 0.2)
+    val_idx = idx[:val_n]
+    tr_idx  = idx[val_n:]
 
-    tr_data  = [train_data[i] for i in tr_idx]
-    val_data = [train_data[i] for i in val_idx]
-    tr_cv    = cv_preds_train[tr_idx]
-    val_cv   = cv_preds_train[val_idx]
-    tr_res   = residuals_train[tr_idx]
-    val_res  = residuals_train[val_idx]
-    val_true = true_xyz[val_idx]
+    def split(arr, is_list=False):
+        if is_list:
+            return [arr[i] for i in tr_idx], [arr[i] for i in val_idx]
+        return arr[tr_idx], arr[val_idx]
 
-    tr_ds  = TrajectoryDataset(tr_data,  tr_cv,  tr_res)
-    val_ds = TrajectoryDataset(val_data, val_cv, val_res)
+    tr_data,  val_data  = split(train_data, is_list=True)
+    tr_cv,    val_cv    = split(cv_preds_train)
+    tr_res,   val_res   = split(residuals_train)
+    val_true            = true_xyz[val_idx]
+
+    tr_ds   = TrajectoryDataset(tr_data,   tr_cv,  tr_res)
+    val_ds  = TrajectoryDataset(val_data,  val_cv, val_res)
     test_ds = TrajectoryDataset(test_data, cv_preds_test)
 
     tr_loader   = DataLoader(tr_ds,   batch_size=256, shuffle=True,  num_workers=0)
     val_loader  = DataLoader(val_ds,  batch_size=512, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=0)
 
-    # 모델
-    model = MosquitoLSTM(hidden=128, layers=2, dropout=0.3).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
-    criterion = nn.HuberLoss(delta=0.005)   # 1cm 스케일에 맞춘 delta
-
+    model = MosquitoBiLSTM(seq_dim=9, global_dim=29,
+                            hidden=128, layers=2, dropout=0.3).to(DEVICE)
     log.info(f"파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 학습
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200, eta_min=1e-5)
+    criterion = nn.HuberLoss(delta=0.005)
+
     best_val_rhit = 0.0
     best_state    = None
-    patience      = 30
     no_improve    = 0
+    patience      = 30
 
     for epoch in range(1, 201):
         tr_loss = train_epoch(model, tr_loader, optimizer, criterion)
@@ -212,9 +294,8 @@ def main():
             val_preds    = val_cv + val_res_pred
             val_rhit     = r_hit(val_preds, val_true)
             val_dist     = mean_dist_cm(val_preds, val_true)
-            lr_now       = scheduler.get_last_lr()[0]
             log.info(f"Epoch {epoch:3d}  loss={tr_loss:.6f}  "
-                     f"val R-Hit={val_rhit:.4f}  val dist={val_dist:.2f}cm  lr={lr_now:.5f}")
+                     f"val R-Hit={val_rhit:.4f}  val dist={val_dist:.2f}cm")
 
             if val_rhit > best_val_rhit:
                 best_val_rhit = val_rhit
@@ -224,27 +305,22 @@ def main():
                 no_improve += 10
 
             if no_improve >= patience:
-                log.info(f"Early stopping at epoch {epoch}  best val R-Hit={best_val_rhit:.4f}")
+                log.info(f"Early stopping  epoch={epoch}  best val R-Hit={best_val_rhit:.4f}")
                 break
 
-    # 최적 모델로 복구
     model.load_state_dict(best_state)
 
-    # Train 전체 성능
-    tr_all_ds     = TrajectoryDataset(train_data, cv_preds_train, residuals_train)
-    tr_all_loader = DataLoader(tr_all_ds, batch_size=512, shuffle=False, num_workers=0)
-    tr_res_pred   = predict(model, tr_all_loader)
-    tr_final      = cv_preds_train + tr_res_pred
-    log.info(f"[LSTM-train] R-Hit={r_hit(tr_final, true_xyz):.4f}  "
+    all_ds     = TrajectoryDataset(train_data, cv_preds_train, residuals_train)
+    all_loader = DataLoader(all_ds, batch_size=512, shuffle=False, num_workers=0)
+    tr_final   = cv_preds_train + predict(model, all_loader)
+    log.info(f"[v6-train] R-Hit={r_hit(tr_final, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(tr_final, true_xyz):.2f}cm  (과적합 참고용)")
-    log.info(f"[LSTM-val]   R-Hit={best_val_rhit:.4f}  (best)")
+    log.info(f"[v6-val]   R-Hit={best_val_rhit:.4f}  (best)")
 
     # 제출
-    test_res_pred = predict(model, test_loader)
-    final_preds_test = cv_preds_test + test_res_pred
-
-    sub      = pd.read_csv(SAMPLE_SUB)
-    pred_map = {tid: pred for tid, pred in zip(test_ids, final_preds_test)}
+    final_test = cv_preds_test + predict(model, test_loader)
+    sub        = pd.read_csv(SAMPLE_SUB)
+    pred_map   = {tid: pred for tid, pred in zip(test_ids, final_test)}
 
     for ci, col in enumerate(['x', 'y', 'z']):
         sub[col] = sub['id'].map(
@@ -253,7 +329,7 @@ def main():
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    out_sub = out_dir / "submission_lstm_v4.csv"
+    out_sub = out_dir / "submission_bilstm_v6.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
