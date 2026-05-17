@@ -1,5 +1,30 @@
 # Changelog
 
+## v3 (2026-05-17)
+
+### 모델
+- XGBoost + 잔차 학습 (Residual Learning)
+- 타깃: `true_xyz - cv_last_pred` (CV-last 대비 오차)
+- 최종 예측: `cv_last_pred + xgb_residual`
+
+### 피처 변경 (v1 대비)
+- CV-last 예측 delta 추가 (`cv_pred - traj[-1]`) → 보정 방향 앵커
+- 절대 위치 복구 (v2에서 제거했다가 성능 하락 확인 후 복구)
+
+### 하이퍼파라미터
+- v1과 동일 (n_estimators=500, max_depth=6, learning_rate=0.05)
+
+---
+
+## v2 (2026-05-17)
+
+### 변경
+- 절대 좌표 피처 제거, max_depth 6→4, n_estimators 500→300
+- reg_alpha=0.1, reg_lambda=2.0 정규화 추가
+- 결과: 0.5950 (v1 대비 하락) → 폐기
+
+---
+
 ## v1 (2026-05-17)
 
 ### 모델

@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from datetime import datetime
 import numpy as np
@@ -18,7 +19,7 @@ DT      = 0.04   # 40 ms
 HORIZON = 2      # 2 steps → +80 ms
 
 
-# ── Logger (stdout only — Docker captures via `docker-compose logs`) ───────────
+# ── Logger ─────────────────────────────────────────────────────────────────────
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("mosquito")
     logger.setLevel(logging.INFO)
@@ -41,16 +42,32 @@ def load_dir(directory: Path) -> tuple[list[str], list[np.ndarray]]:
     return ids, data
 
 
+# ── CV-last ────────────────────────────────────────────────────────────────────
+def predict_cv_last(traj: np.ndarray) -> np.ndarray:
+    vel = (traj[-1] - traj[-2]) / DT
+    return traj[-1] + vel * DT * HORIZON
+
+
+def batch_cv_last(data: list[np.ndarray]) -> np.ndarray:
+    return np.array([predict_cv_last(t) for t in data])
+
+
 # ── Feature engineering ────────────────────────────────────────────────────────
-def extract_features(traj: np.ndarray) -> np.ndarray:
+def extract_features(traj: np.ndarray, cv_pred: np.ndarray) -> np.ndarray:
     """
-    traj: (11, 3) — 순수 운동 패턴 피처만 사용 (절대 좌표 제외)
-    v1 대비 변경: traj[-1] (절대 위치) 제거 → 공간 암기 방지
+    v3: CV-last 예측값을 피처로 추가
+    → XGBoost가 CV-last의 보정량(잔차)을 학습하도록 앵커 역할
     """
     vels  = np.diff(traj, axis=0) / DT   # (10, 3)
     accs  = np.diff(vels, axis=0) / DT   # (9, 3)
 
     feats = []
+
+    # 절대 위치 (v1에서 유효했음)
+    feats.append(traj[-1])                             # (3,)
+
+    # CV-last 예측 delta (잔차 학습의 앵커)
+    feats.append(cv_pred - traj[-1])                   # (3,)
 
     # 속도 시계열 전체 (10 x 3 = 30)
     feats.append(vels.flatten())
@@ -59,43 +76,36 @@ def extract_features(traj: np.ndarray) -> np.ndarray:
     feats.append(accs.flatten())
 
     # 속도 통계
-    feats.append(vels.mean(axis=0))               # 평균 속도 (3,)
-    feats.append(vels.std(axis=0))                # 속도 표준편차 (3,)
+    feats.append(vels.mean(axis=0))
+    feats.append(vels.std(axis=0))
 
-    # 최근 속도 vs 전체 평균 (방향 전환 감지)
+    # 최근 속도 vs 전체 평균
     recent_vel = vels[-3:].mean(axis=0)
-    feats.append(recent_vel)                       # (3,)
-    feats.append(recent_vel - vels.mean(axis=0))  # 추세 변화 (3,)
+    feats.append(recent_vel)
+    feats.append(recent_vel - vels.mean(axis=0))
 
     # 가속도 통계
-    feats.append(accs.mean(axis=0))               # (3,)
-    feats.append(accs[-3:].mean(axis=0))          # 최근 가속도 (3,)
+    feats.append(accs.mean(axis=0))
+    feats.append(accs[-3:].mean(axis=0))
 
-    # 전체 변위 (t=-400 → t=0) — 이동 방향/거리 패턴
-    feats.append(traj[-1] - traj[0])              # (3,)
+    # 전체 변위
+    feats.append(traj[-1] - traj[0])
 
-    # 속력 (방향 무관)
-    speeds = np.linalg.norm(vels, axis=1)         # (10,)
+    # 속력
+    speeds = np.linalg.norm(vels, axis=1)
     feats.append(speeds)
     feats.append(np.array([speeds.mean(), speeds.std(), speeds[-1]]))
 
     return np.concatenate(feats)
 
 
-def build_features(data: list[np.ndarray]) -> np.ndarray:
-    return np.array([extract_features(t) for t in data])
-
-
-# ── 기준선: CV-last ────────────────────────────────────────────────────────────
-def predict_cv_last(traj: np.ndarray) -> np.ndarray:
-    vel = (traj[-1] - traj[-2]) / DT
-    return traj[-1] + vel * DT * HORIZON
+def build_features(data: list[np.ndarray], cv_preds: np.ndarray) -> np.ndarray:
+    return np.array([extract_features(t, cv) for t, cv in zip(data, cv_preds)])
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
 def r_hit(preds: np.ndarray, trues: np.ndarray, threshold: float = 0.01) -> float:
-    dists = np.linalg.norm(preds - trues, axis=1)
-    return float(np.mean(dists <= threshold))
+    return float(np.mean(np.linalg.norm(preds - trues, axis=1) <= threshold))
 
 
 def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
@@ -106,7 +116,7 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
 def main():
     log = setup_logger()
     log.info("=" * 50)
-    log.info("모기 비행 궤적 예측 시작")
+    log.info("모기 비행 궤적 예측 v3 (잔차 학습)")
     log.info("=" * 50)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -116,60 +126,59 @@ def main():
     labels   = pd.read_csv(LABELS_CSV, index_col='id')
     true_xyz = labels.loc[train_ids, ['x', 'y', 'z']].values
 
-    last_pos_train = np.array([t[-1] for t in train_data])
-    delta_train    = true_xyz - last_pos_train
+    # ── CV-last 기준선 ─────────────────────────────────────────────────────────
+    cv_preds_train = batch_cv_last(train_data)
+    cv_preds_test  = batch_cv_last(test_data)
+    log.info(f"[CV-last]  R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    X_train = build_features(train_data)
-    X_test  = build_features(test_data)
+    # ── 피처 / 타깃 구성 ───────────────────────────────────────────────────────
+    X_train = build_features(train_data, cv_preds_train)
+    X_test  = build_features(test_data,  cv_preds_test)
     log.info(f"Feature dim: {X_train.shape[1]}")
 
-    # ── 기준선 성능 ────────────────────────────────────────────────────────────
-    cv_preds = np.array([predict_cv_last(t) for t in train_data])
-    log.info(f"[CV-last]   R-Hit={r_hit(cv_preds, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(cv_preds, true_xyz):.2f}cm")
+    # 타깃: CV-last 대비 잔차 (delta → residual)
+    residual_train = true_xyz - cv_preds_train
+    log.info(f"Residual 크기: mean={np.linalg.norm(residual_train, axis=1).mean()*100:.2f}cm  "
+             f"std={np.linalg.norm(residual_train, axis=1).std()*100:.2f}cm")
 
     # ── XGBoost 학습 ───────────────────────────────────────────────────────────
-    # v2: 복잡도 축소 + 정규화 강화로 과적합 감소
     xgb_params = dict(
-        n_estimators=300,
-        max_depth=4,
+        n_estimators=500,
+        max_depth=6,
         learning_rate=0.05,
         subsample=0.8,
-        colsample_bytree=0.7,
-        min_child_weight=5,
-        reg_alpha=0.1,
-        reg_lambda=2.0,
+        colsample_bytree=0.8,
+        min_child_weight=3,
         random_state=42,
         n_jobs=-1,
     )
     log.info(f"XGBoost 학습 시작  params={xgb_params}")
 
     model = MultiOutputRegressor(XGBRegressor(**xgb_params), n_jobs=3)
-    model.fit(X_train, delta_train)
+    model.fit(X_train, residual_train)
     log.info("XGBoost 학습 완료")
 
-    delta_pred_train = model.predict(X_train)
-    xgb_preds_train  = last_pos_train + delta_pred_train
-    log.info(f"[XGB-train] R-Hit={r_hit(xgb_preds_train, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(xgb_preds_train, true_xyz):.2f}cm  (과적합 참고용)")
+    # 최종 예측 = CV-last + 잔차 보정
+    residual_pred_train = model.predict(X_train)
+    final_preds_train   = cv_preds_train + residual_pred_train
+    log.info(f"[XGB-v3-train] R-Hit={r_hit(final_preds_train, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(final_preds_train, true_xyz):.2f}cm  (과적합 참고용)")
 
-    # ── 실패 샘플 요약 (XGB 기준 오차 상위 10개만) ────────────────────────────
-    dists_xgb = np.linalg.norm(xgb_preds_train - true_xyz, axis=1) * 100
-    top_fail_idx = np.argsort(dists_xgb)[::-1][:10]
+    # ── 오차 상위 10개 ─────────────────────────────────────────────────────────
+    dists = np.linalg.norm(final_preds_train - true_xyz, axis=1) * 100
     log.info("-" * 50)
-    log.info("XGB 오차 상위 10개 샘플:")
-    for i in top_fail_idx:
-        d_cv  = np.linalg.norm(cv_preds[i] - true_xyz[i]) * 100
-        d_xgb = dists_xgb[i]
-        log.info(f"  {train_ids[i]}  CV={d_cv:.2f}cm  XGB={d_xgb:.2f}cm")
+    log.info("오차 상위 10개:")
+    for i in np.argsort(dists)[::-1][:10]:
+        log.info(f"  {train_ids[i]}  CV={np.linalg.norm(cv_preds_train[i]-true_xyz[i])*100:.2f}cm  "
+                 f"XGB={dists[i]:.2f}cm")
 
-    # ── 테스트 예측 및 제출 ────────────────────────────────────────────────────
-    delta_pred_test = model.predict(X_test)
-    last_pos_test   = np.array([t[-1] for t in test_data])
-    xgb_preds_test  = last_pos_test + delta_pred_test
+    # ── 제출 파일 ──────────────────────────────────────────────────────────────
+    residual_pred_test = model.predict(X_test)
+    final_preds_test   = cv_preds_test + residual_pred_test
 
     sub      = pd.read_csv(SAMPLE_SUB)
-    pred_map = {tid: pred for tid, pred in zip(test_ids, xgb_preds_test)}
+    pred_map = {tid: pred for tid, pred in zip(test_ids, final_preds_test)}
 
     for ci, col in enumerate(['x', 'y', 'z']):
         sub[col] = sub['id'].map(
@@ -178,8 +187,13 @@ def main():
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    out_sub = out_dir / "submission_xgb_v2.csv"
+    out_sub = out_dir / "submission_xgb_v3.csv"
     sub.to_csv(out_sub, index=False)
+
+    # 컨테이너가 root로 실행되므로 호스트에서 삭제 가능하도록 권한 개방
+    os.chmod(out_sub, 0o666)
+    os.chmod(out_dir, 0o777)
+
     log.info(f"제출 파일 저장 → {out_sub}")
     log.info("완료")
 
