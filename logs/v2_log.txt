@@ -1,0 +1,50 @@
+docker compose up --build
+[+] Building 3.1s (13/13) FINISHED                        
+ => [internal] load local bake definitions           0.0s
+ => => reading from stdin 488B                       0.0s
+ => [internal] load build definition from dockerfil  0.0s
+ => => transferring dockerfile: 285B                 0.0s
+ => [internal] load metadata for docker.io/library/  0.0s
+ => [internal] load .dockerignore                    0.0s
+ => => transferring context: 2B                      0.0s
+ => [1/6] FROM docker.io/library/python:3.11-slim    0.0s
+ => [internal] load build context                    0.4s
+ => => transferring context: 1.60MB                  0.3s
+ => CACHED [2/6] WORKDIR /app                        0.0s
+ => CACHED [3/6] COPY requirements.txt .             0.0s
+ => CACHED [4/6] RUN pip install --no-cache-dir -r   0.0s
+ => [5/6] COPY . .                                   1.1s
+ => [6/6] RUN mkdir -p /app/logs /app/output && chm  0.2s
+ => exporting to image                               1.3s
+ => => exporting layers                              1.2s
+ => => writing image sha256:1de0f3bd2fe9d3df71d4dfe  0.0s
+ => => naming to docker.io/library/test-mosquito     0.0s
+ => resolving provenance for metadata file           0.0s
+[+] up 2/2
+ ✔ Image test-mosquito       Built                   3.2s 
+ ✔ Container test-mosquito-1 Recreated               0.1s 
+Attaching to mosquito-1
+mosquito-1  | 13:47:47  ==================================================
+mosquito-1  | 13:47:47  모기 비행 궤적 예측 시작
+mosquito-1  | 13:47:47  ==================================================
+mosquito-1  | 13:47:51  Train 샘플: 10000개  |  Test 샘플: 10000개
+mosquito-1  | 13:47:51  Feature dim: 91
+mosquito-1  | 13:47:51  [CV-last]   R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 13:47:51  XGBoost 학습 시작  params={'n_estimators': 300, 'max_depth': 4, 'learning_rate': 0.05, 'subsample': 0.8, 'colsample_bytree': 0.7, 'min_child_weight': 5, 'reg_alpha': 0.1, 'reg_lambda': 2.0, 'random_state': 42, 'n_jobs': -1}
+mosquito-1  | 13:47:52  XGBoost 학습 완료
+mosquito-1  | 13:47:52  [XGB-train] R-Hit=0.6412  MeanDist=1.05cm  (과적합 참고용)
+mosquito-1  | 13:47:52  --------------------------------------------------
+mosquito-1  | 13:47:52  XGB 오차 상위 10개 샘플:
+mosquito-1  | 13:47:52    TRAIN_03230  CV=16.80cm  XGB=12.36cm
+mosquito-1  | 13:47:52    TRAIN_06991  CV=15.98cm  XGB=11.04cm
+mosquito-1  | 13:47:52    TRAIN_05399  CV=16.16cm  XGB=10.80cm
+mosquito-1  | 13:47:52    TRAIN_01375  CV=13.66cm  XGB=10.73cm
+mosquito-1  | 13:47:52    TRAIN_05181  CV=16.97cm  XGB=10.21cm
+mosquito-1  | 13:47:52    TRAIN_05124  CV=14.54cm  XGB=9.86cm
+mosquito-1  | 13:47:52    TRAIN_04844  CV=13.42cm  XGB=9.68cm
+mosquito-1  | 13:47:52    TRAIN_08638  CV=11.09cm  XGB=9.55cm
+mosquito-1  | 13:47:52    TRAIN_05439  CV=13.63cm  XGB=9.30cm
+mosquito-1  | 13:47:52    TRAIN_02911  CV=15.88cm  XGB=9.29cm
+mosquito-1  | 13:47:53  제출 파일 저장 → output/submission_xgb_v2.csv
+mosquito-1  | 13:47:53  완료
+mosquito-1 exited with code 0

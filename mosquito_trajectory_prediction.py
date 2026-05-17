@@ -44,44 +44,38 @@ def load_dir(directory: Path) -> tuple[list[str], list[np.ndarray]]:
 # ── Feature engineering ────────────────────────────────────────────────────────
 def extract_features(traj: np.ndarray) -> np.ndarray:
     """
-    traj: (11, 3)
-    반환: 1D feature vector
-
-    설계 원칙: 절대 좌표 대신 상대 변위 위주로 구성
-    → train/test 환경이 달라도 운동 패턴은 유지됨
+    traj: (11, 3) — 순수 운동 패턴 피처만 사용 (절대 좌표 제외)
+    v1 대비 변경: traj[-1] (절대 위치) 제거 → 공간 암기 방지
     """
-    vels  = np.diff(traj, axis=0) / DT          # (10, 3) - 속도
-    accs  = np.diff(vels, axis=0) / DT           # (9, 3)  - 가속도
+    vels  = np.diff(traj, axis=0) / DT   # (10, 3)
+    accs  = np.diff(vels, axis=0) / DT   # (9, 3)
 
     feats = []
 
-    # 마지막 관측 위치 (t=0)
-    feats.append(traj[-1])                        # (3,)
-
-    # 전체 속도 시계열 (10 x 3 = 30)
+    # 속도 시계열 전체 (10 x 3 = 30)
     feats.append(vels.flatten())
 
-    # 전체 가속도 시계열 (9 x 3 = 27)
+    # 가속도 시계열 전체 (9 x 3 = 27)
     feats.append(accs.flatten())
 
     # 속도 통계
-    feats.append(vels.mean(axis=0))              # 평균 속도 (3,)
-    feats.append(vels.std(axis=0))               # 속도 표준편차 (3,)
+    feats.append(vels.mean(axis=0))               # 평균 속도 (3,)
+    feats.append(vels.std(axis=0))                # 속도 표준편차 (3,)
 
     # 최근 속도 vs 전체 평균 (방향 전환 감지)
     recent_vel = vels[-3:].mean(axis=0)
-    feats.append(recent_vel)                      # (3,)
-    feats.append(recent_vel - vels.mean(axis=0)) # 최근 추세 변화 (3,)
+    feats.append(recent_vel)                       # (3,)
+    feats.append(recent_vel - vels.mean(axis=0))  # 추세 변화 (3,)
 
     # 가속도 통계
-    feats.append(accs.mean(axis=0))              # (3,)
-    feats.append(accs[-3:].mean(axis=0))         # 최근 가속도 (3,)
+    feats.append(accs.mean(axis=0))               # (3,)
+    feats.append(accs[-3:].mean(axis=0))          # 최근 가속도 (3,)
 
-    # 이동 궤적 전체 변위 (t=-400 → t=0)
-    feats.append(traj[-1] - traj[0])             # (3,)
+    # 전체 변위 (t=-400 → t=0) — 이동 방향/거리 패턴
+    feats.append(traj[-1] - traj[0])              # (3,)
 
-    # 속도 크기 (방향 무관 속력)
-    speeds = np.linalg.norm(vels, axis=1)        # (10,)
+    # 속력 (방향 무관)
+    speeds = np.linalg.norm(vels, axis=1)         # (10,)
     feats.append(speeds)
     feats.append(np.array([speeds.mean(), speeds.std(), speeds[-1]]))
 
@@ -135,13 +129,16 @@ def main():
              f"MeanDist={mean_dist_cm(cv_preds, true_xyz):.2f}cm")
 
     # ── XGBoost 학습 ───────────────────────────────────────────────────────────
+    # v2: 복잡도 축소 + 정규화 강화로 과적합 감소
     xgb_params = dict(
-        n_estimators=500,
-        max_depth=6,
+        n_estimators=300,
+        max_depth=4,
         learning_rate=0.05,
         subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=3,
+        colsample_bytree=0.7,
+        min_child_weight=5,
+        reg_alpha=0.1,
+        reg_lambda=2.0,
         random_state=42,
         n_jobs=-1,
     )
@@ -181,7 +178,7 @@ def main():
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    out_sub = out_dir / "submission_xgb.csv"
+    out_sub = out_dir / "submission_xgb_v2.csv"
     sub.to_csv(out_sub, index=False)
     log.info(f"제출 파일 저장 → {out_sub}")
     log.info("완료")
