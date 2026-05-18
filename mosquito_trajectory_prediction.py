@@ -4,10 +4,8 @@ import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
-
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from sklearn.multioutput import MultiOutputRegressor
+import xgboost as xgb
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 DATA_DIR   = Path("data")
@@ -18,8 +16,6 @@ SAMPLE_SUB = DATA_DIR / "sample_submission.csv"
 
 DT      = 0.04
 HORIZON = 2
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ── Logger ─────────────────────────────────────────────────────────────────────
@@ -33,7 +29,7 @@ def setup_logger() -> logging.Logger:
 
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v6_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v7_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -61,135 +57,180 @@ def batch_cv_last(data: list[np.ndarray]) -> np.ndarray:
     return np.array([predict_cv_last(t) for t in data])
 
 
-# ── Feature engineering helpers ────────────────────────────────────────────────
+# ── Feature engineering ────────────────────────────────────────────────────────
 def _turn_cos(vels: np.ndarray) -> np.ndarray:
     """Cosine similarity between consecutive velocity vectors. (10,)"""
-    eps = 1e-8
-    norms = np.linalg.norm(vels, axis=1)  # (10,)
-    cos = np.zeros(len(vels))
+    eps   = 1e-8
+    norms = np.linalg.norm(vels, axis=1)
+    cos   = np.zeros(len(vels))
     for i in range(1, len(vels)):
-        denom = norms[i] * norms[i - 1] + eps
-        cos[i] = np.dot(vels[i], vels[i - 1]) / denom
+        cos[i] = np.dot(vels[i], vels[i - 1]) / (norms[i] * norms[i - 1] + eps)
     return cos
 
 
-def make_seq_features(traj: np.ndarray) -> np.ndarray:
-    """
-    LSTM 입력: (10, 9) per-timestep 시퀀스
-    [vx, vy, vz, ax, ay, az, speed, acc_mag, turn_cos]
-    """
-    vels  = np.diff(traj, axis=0) / DT            # (10, 3)
-    accs  = np.diff(vels, axis=0) / DT             # (9, 3)
-    accs  = np.vstack([np.zeros((1, 3)), accs])    # (10, 3)
+def make_xgb_features(traj: np.ndarray, cv_pred: np.ndarray) -> np.ndarray:
+    """274개 피처 벡터"""
+    vels      = np.diff(traj, axis=0) / DT                      # (10, 3)
+    accs_raw  = np.diff(vels, axis=0) / DT                      # (9, 3)
+    accs      = np.vstack([np.zeros((1, 3)), accs_raw])          # (10, 3) zero-pad
+    jerk_raw  = np.diff(accs_raw, axis=0) / DT                  # (8, 3)
+    jerk      = np.vstack([np.zeros((2, 3)), jerk_raw])          # (10, 3) zero-pad
 
-    speed    = np.linalg.norm(vels, axis=1, keepdims=True)   # (10, 1)
-    acc_mag  = np.linalg.norm(accs, axis=1, keepdims=True)   # (10, 1)
-    turn_cos = _turn_cos(vels).reshape(-1, 1)                 # (10, 1)
+    speed       = np.linalg.norm(vels, axis=1)                  # (10,)
+    acc_mag     = np.linalg.norm(accs, axis=1)                  # (10,)
+    jerk_mag    = np.linalg.norm(jerk, axis=1)                  # (10,)
+    speed_delta = np.concatenate([[0], np.diff(speed)])          # (10,) zero-pad
 
-    return np.concatenate([vels, accs, speed, acc_mag, turn_cos], axis=1).astype(np.float32)  # (10, 9)
+    turn_cos = _turn_cos(vels)                                   # (10,)
 
+    # Frenet curvature κ = |v × a| / |v|³  +  rotation axis direction
+    kappa     = np.zeros(10)
+    rot_axes  = np.zeros((10, 3))
+    for i in range(1, 10):
+        cross      = np.cross(vels[i], accs[i])
+        cross_norm = np.linalg.norm(cross)
+        v_norm     = np.linalg.norm(vels[i])
+        kappa[i]   = cross_norm / (v_norm ** 3 + 1e-8)
+        rot_axes[i] = cross / (cross_norm + 1e-8)
 
-def make_global_features(traj: np.ndarray, cv_pred: np.ndarray) -> np.ndarray:
-    """
-    FC에 concat되는 글로벌 피처 (29,)
-    """
-    vels  = np.diff(traj, axis=0) / DT    # (10, 3)
-    accs  = np.diff(vels, axis=0) / DT    # (9, 3)
-    speed = np.linalg.norm(vels, axis=1)  # (10,)
+    # Multi-scale CV predictions
+    cv_1   = traj[-1] + vels[-1] * DT * HORIZON
+    cv_3   = traj[-1] + vels[-3:].mean(0) * DT * HORIZON
+    cv_5   = traj[-1] + vels[-5:].mean(0) * DT * HORIZON
+    cv_all = traj[-1] + vels.mean(0) * DT * HORIZON
+    cv_spread = np.array([np.std([cv_1[i], cv_3[i], cv_5[i]]) for i in range(3)])
 
-    recent_vel  = vels[-3:].mean(axis=0)
-    overall_vel = vels.mean(axis=0)
+    # Geometric summary
+    path_len    = np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1))
+    disp_mag    = np.linalg.norm(traj[-1] - traj[0])
+    straightness = disp_mag / (path_len + 1e-8)
 
-    # turn angle stats (4)
-    turn_cos      = _turn_cos(vels)       # (10,)
-    turn_mean     = turn_cos[1:].mean()
-    turn_std      = turn_cos[1:].std()
-    turn_min      = turn_cos[1:].min()
-    turn_last     = turn_cos[-1]
+    t_idx       = np.arange(10)
+    speed_slope = float(np.polyfit(t_idx, speed, 1)[0])
 
-    # speed change rate stats (2)
-    speed_delta   = np.diff(speed)        # (9,)
-    spd_chg_mean  = speed_delta.mean()
-    spd_chg_std   = speed_delta.std()
+    vel_early    = vels[:5].mean(0)
+    vel_late     = vels[5:].mean(0)
+    last_vel_unit = vels[-1] / (np.linalg.norm(vels[-1]) + 1e-8)
 
-    # last velocity unit vector (3)
-    last_vel_norm = np.linalg.norm(vels[-1]) + 1e-8
-    last_vel_unit = vels[-1] / last_vel_norm
-
-    # CV-delta alignment with last velocity direction (1)
-    cv_delta      = cv_pred - traj[-1]
-    cv_delta_norm = np.linalg.norm(cv_delta) + 1e-8
-    cv_align      = np.dot(cv_delta / cv_delta_norm, last_vel_unit)
-
-    # speed slope — linear fit over all 10 steps (1)
-    t_idx         = np.arange(len(speed))
-    speed_slope   = float(np.polyfit(t_idx, speed, 1)[0])
+    cv_delta     = cv_pred - traj[-1]
+    cv_align     = np.dot(cv_delta / (np.linalg.norm(cv_delta) + 1e-8), last_vel_unit)
 
     feats = np.concatenate([
-        cv_delta,                                          # CV-last delta (3)
-        recent_vel - overall_vel,                          # 최근 방향 전환 세기 (3)
-        accs[-3:].mean(axis=0),                            # 최근 가속도 (3)
-        accs.std(axis=0),                                  # 가속도 변동성 (3)
-        [speed.mean(), speed.std(), speed[-1]],            # 속력 통계 (3)
-        traj[-1] - traj[0],                                # 전체 변위 (3)
-        [turn_mean, turn_std, turn_min, turn_last],        # 방향 전환 통계 (4)
-        [spd_chg_mean, spd_chg_std],                       # 속력 변화율 통계 (2)
-        last_vel_unit,                                     # 마지막 속도 단위벡터 (3)
-        [cv_align],                                        # CV-delta 정렬도 (1)
-        [speed_slope],                                     # 속력 기울기 (1)
+        # ── 시계열 (XGBoost가 스텝별 패턴 학습) ────────────────────────────────
+        vels.flatten(),          # (30) 속도 xyz × 10스텝
+        accs.flatten(),          # (30) 가속도 xyz × 10스텝
+        jerk.flatten(),          # (30) 저크 xyz × 10스텝
+        speed,                   # (10) 속력 시계열
+        acc_mag,                 # (10) 가속도 크기 시계열
+        jerk_mag,                # (10) 저크 크기 시계열
+        speed_delta,             # (10) 속력 변화율 시계열
+        turn_cos,                # (10) 방향 전환 코사인 시계열
+        kappa,                   # (10) 곡률 시계열
+        rot_axes.flatten(),      # (30) 회전축 방향 시계열
+
+        # ── 위치 시계열 ─────────────────────────────────────────────────────────
+        traj.flatten(),          # (33) 절대 위치 xyz × 11스텝
+
+        # ── 멀티스케일 CV ───────────────────────────────────────────────────────
+        cv_pred - traj[-1],      # (3) CV-last delta
+        cv_1   - traj[-1],       # (3) 1스텝 CV delta (=cv_pred)
+        cv_3   - traj[-1],       # (3) 3스텝 평균 CV delta
+        cv_5   - traj[-1],       # (3) 5스텝 평균 CV delta
+        cv_all - traj[-1],       # (3) 전체 평균 CV delta
+        cv_1   - cv_5,           # (3) 단기 vs 장기 CV 불일치
+        cv_spread,               # (3) 스케일 간 분산
+
+        # ── 요약 통계 ───────────────────────────────────────────────────────────
+        [turn_cos[1:].mean(), turn_cos[1:].std(),
+         turn_cos[1:].min(),  turn_cos[-1]],       # (4) 방향 전환 통계
+        [speed.mean(), speed.std(),
+         speed[-1],    speed_slope],               # (4) 속력 통계
+        [speed_delta[1:].mean(), speed_delta[1:].std()],  # (2) 속력 변화율 통계
+        [jerk_mag[2:].mean(), jerk_mag[2:].std(), jerk_mag[2:].max()],  # (3) 저크 통계
+        [kappa[1:].mean(), kappa[1:].std(),
+         kappa[1:].max(),  kappa[-1]],             # (4) 곡률 통계
+        [acc_mag[1:].mean(), acc_mag[1:].std(), acc_mag[1:].max()],  # (3) 가속도 크기 통계
+        vel_late - vel_early,    # (3) 전후반 속도 차이
+        last_vel_unit,           # (3) 마지막 속도 단위벡터
+        [cv_align],              # (1) CV-delta 정렬도
+        [straightness],          # (1) 경로 직선성
+        traj[-1] - traj[0],      # (3) 전체 변위 벡터
+        vels[-3:].mean(0) - vels.mean(0),  # (3) 최근 vs 전체 방향 전환
+        accs[1:].mean(0),        # (3) 평균 가속도
+        accs[-3:].mean(0),       # (3) 최근 가속도
     ])
-    return feats.astype(np.float32)  # (29,)
+    return feats.astype(np.float32)
 
 
-# ── Dataset ────────────────────────────────────────────────────────────────────
-class TrajectoryDataset(Dataset):
-    def __init__(self, data: list[np.ndarray], cv_preds: np.ndarray,
-                 residuals: np.ndarray | None = None):
-        self.seq     = np.array([make_seq_features(t) for t in data])        # (N, 10, 9)
-        self.global_ = np.array([make_global_features(t, cv)
-                                  for t, cv in zip(data, cv_preds)])          # (N, 29)
-        self.res     = residuals.astype(np.float32) if residuals is not None else None
+def make_feature_names() -> list[str]:
+    """make_xgb_features 출력 순서와 동일한 피처 이름 리스트"""
+    axes = ['x', 'y', 'z']
+    names: list[str] = []
 
-    def __len__(self):
-        return len(self.seq)
+    for step in range(10):
+        for ax in axes:
+            names.append(f"vel_{ax}_t{step}")
+    for step in range(10):
+        for ax in axes:
+            names.append(f"acc_{ax}_t{step}")
+    for step in range(10):
+        for ax in axes:
+            names.append(f"jerk_{ax}_t{step}")
+    for step in range(10):
+        names.append(f"speed_t{step}")
+    for step in range(10):
+        names.append(f"acc_mag_t{step}")
+    for step in range(10):
+        names.append(f"jerk_mag_t{step}")
+    for step in range(10):
+        names.append(f"speed_delta_t{step}")
+    for step in range(10):
+        names.append(f"turn_cos_t{step}")
+    for step in range(10):
+        names.append(f"kappa_t{step}")
+    for step in range(10):
+        for ax in axes:
+            names.append(f"rot_axis_{ax}_t{step}")
+    for step in range(11):
+        for ax in axes:
+            names.append(f"pos_{ax}_t{step}")
 
-    def __getitem__(self, idx):
-        if self.res is not None:
-            return self.seq[idx], self.global_[idx], self.res[idx]
-        return self.seq[idx], self.global_[idx]
+    for ax in axes:
+        names.append(f"cv_last_delta_{ax}")
+    for ax in axes:
+        names.append(f"cv_1_delta_{ax}")
+    for ax in axes:
+        names.append(f"cv_3_delta_{ax}")
+    for ax in axes:
+        names.append(f"cv_5_delta_{ax}")
+    for ax in axes:
+        names.append(f"cv_all_delta_{ax}")
+    for ax in axes:
+        names.append(f"cv_short_long_div_{ax}")
+    for ax in axes:
+        names.append(f"cv_spread_{ax}")
 
+    names += ["turn_mean", "turn_std", "turn_min", "turn_last"]
+    names += ["speed_mean", "speed_std", "speed_last", "speed_slope"]
+    names += ["spd_delta_mean", "spd_delta_std"]
+    names += ["jerk_mean", "jerk_std", "jerk_max"]
+    names += ["kappa_mean", "kappa_std", "kappa_max", "kappa_last"]
+    names += ["acc_mag_mean", "acc_mag_std", "acc_mag_max"]
+    for ax in axes:
+        names.append(f"vel_late_early_{ax}")
+    for ax in axes:
+        names.append(f"last_vel_unit_{ax}")
+    names += ["cv_align", "straightness"]
+    for ax in axes:
+        names.append(f"disp_{ax}")
+    for ax in axes:
+        names.append(f"recent_vs_overall_{ax}")
+    for ax in axes:
+        names.append(f"mean_acc_{ax}")
+    for ax in axes:
+        names.append(f"recent_acc_{ax}")
 
-# ── Model ──────────────────────────────────────────────────────────────────────
-class MosquitoBiLSTM(nn.Module):
-    def __init__(self, seq_dim: int = 9, global_dim: int = 29,
-                 hidden: int = 128, layers: int = 2, dropout: float = 0.3):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=seq_dim,
-            hidden_size=hidden,
-            num_layers=layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if layers > 1 else 0.0,
-        )
-        lstm_out = hidden * 2
-        self.fc = nn.Sequential(
-            nn.Linear(lstm_out + global_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(64, 3),
-        )
-
-    def forward(self, seq, global_feat):
-        _, (h, _) = self.lstm(seq)
-        h_fwd = h[-2]
-        h_bwd = h[-1]
-        h_cat = torch.cat([h_fwd, h_bwd], dim=1)
-        x = torch.cat([h_cat, global_feat], dim=1)
-        return self.fc(x)
+    return names
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
@@ -201,37 +242,12 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(preds - trues, axis=1)) * 100)
 
 
-# ── Train / Predict ────────────────────────────────────────────────────────────
-def train_epoch(model, loader, optimizer, criterion):
-    model.train()
-    total = 0.0
-    for seq, glo, target in loader:
-        seq, glo, target = seq.to(DEVICE), glo.to(DEVICE), target.to(DEVICE)
-        optimizer.zero_grad()
-        loss = criterion(model(seq, glo), target)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        total += loss.item() * len(seq)
-    return total / len(loader.dataset)
-
-
-@torch.no_grad()
-def predict(model, loader):
-    model.eval()
-    preds = []
-    for batch in loader:
-        seq, glo = batch[0].to(DEVICE), batch[1].to(DEVICE)
-        preds.append(model(seq, glo).cpu().numpy())
-    return np.concatenate(preds)
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
-    log.info("=" * 50)
-    log.info(f"모기 비행 궤적 예측 v6 (BiLSTM + FE 강화)  device={DEVICE}")
-    log.info("=" * 50)
+    log.info("=" * 55)
+    log.info("모기 비행 궤적 예측 v7 (XGBoost + 피처 확장 + 잔차학습)")
+    log.info("=" * 55)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
     test_ids,  test_data  = load_dir(TEST_DIR)
@@ -245,91 +261,95 @@ def main():
     log.info(f"[CV-last]  R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    residuals_train = (true_xyz - cv_preds_train).astype(np.float32)
+    residuals_train = true_xyz - cv_preds_train
+
+    log.info("피처 생성 중...")
+    X_train = np.array([make_xgb_features(t, cv)
+                        for t, cv in zip(train_data, cv_preds_train)])
+    X_test  = np.array([make_xgb_features(t, cv)
+                        for t, cv in zip(test_data, cv_preds_test)])
+    feat_names = make_feature_names()
+    log.info(f"피처 수: {X_train.shape[1]}")
 
     # Train / Val 분리
-    n = len(train_data)
+    n   = len(train_data)
     idx = np.random.RandomState(42).permutation(n)
     val_n   = int(n * 0.2)
     val_idx = idx[:val_n]
     tr_idx  = idx[val_n:]
 
-    def split(arr, is_list=False):
-        if is_list:
-            return [arr[i] for i in tr_idx], [arr[i] for i in val_idx]
-        return arr[tr_idx], arr[val_idx]
+    X_tr,   X_val  = X_train[tr_idx],          X_train[val_idx]
+    y_tr,   y_val  = residuals_train[tr_idx],  residuals_train[val_idx]
+    val_cv          = cv_preds_train[val_idx]
+    val_true        = true_xyz[val_idx]
 
-    tr_data,  val_data  = split(train_data, is_list=True)
-    tr_cv,    val_cv    = split(cv_preds_train)
-    tr_res,   val_res   = split(residuals_train)
-    val_true            = true_xyz[val_idx]
+    base_xgb = xgb.XGBRegressor(
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.7,
+        min_child_weight=3,
+        tree_method='hist',
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0,
+    )
+    model = MultiOutputRegressor(base_xgb, n_jobs=1)
 
-    tr_ds   = TrajectoryDataset(tr_data,   tr_cv,  tr_res)
-    val_ds  = TrajectoryDataset(val_data,  val_cv, val_res)
-    test_ds = TrajectoryDataset(test_data, cv_preds_test)
+    log.info("XGBoost 학습 중...")
+    model.fit(X_tr, y_tr)
 
-    tr_loader   = DataLoader(tr_ds,   batch_size=256, shuffle=True,  num_workers=0)
-    val_loader  = DataLoader(val_ds,  batch_size=512, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=0)
+    # Validation
+    val_res_pred = model.predict(X_val)
+    val_preds    = val_cv + val_res_pred
+    log.info(f"[v7-val]   R-Hit={r_hit(val_preds, val_true):.4f}  "
+             f"MeanDist={mean_dist_cm(val_preds, val_true):.2f}cm")
 
-    model = MosquitoBiLSTM(seq_dim=9, global_dim=29,
-                            hidden=128, layers=2, dropout=0.3).to(DEVICE)
-    log.info(f"파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
+    # Train performance
+    tr_res_pred = model.predict(X_train)
+    tr_preds    = cv_preds_train + tr_res_pred
+    log.info(f"[v7-train] R-Hit={r_hit(tr_preds, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(tr_preds, true_xyz):.2f}cm  (과적합 참고용)")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200, eta_min=1e-5)
-    criterion = nn.HuberLoss(delta=0.005)
+    # Feature importance (평균 across x/y/z)
+    importances = np.array(
+        [est.feature_importances_ for est in model.estimators_]
+    ).mean(axis=0)
 
-    best_val_rhit = 0.0
-    best_state    = None
-    no_improve    = 0
-    patience      = 30
+    top_n   = 40
+    top_idx = np.argsort(importances)[::-1][:top_n]
+    log.info(f"\n{'='*55}")
+    log.info(f"Top {top_n} 피처 중요도 (x/y/z 평균)")
+    log.info(f"{'='*55}")
+    for rank, i in enumerate(top_idx, 1):
+        name = feat_names[i] if i < len(feat_names) else f"feat_{i}"
+        log.info(f"  {rank:2d}. {name:<35s}  {importances[i]:.4f}")
 
-    for epoch in range(1, 201):
-        tr_loss = train_epoch(model, tr_loader, optimizer, criterion)
-        scheduler.step()
-
-        if epoch % 10 == 0 or epoch == 1:
-            val_res_pred = predict(model, val_loader)
-            val_preds    = val_cv + val_res_pred
-            val_rhit     = r_hit(val_preds, val_true)
-            val_dist     = mean_dist_cm(val_preds, val_true)
-            log.info(f"Epoch {epoch:3d}  loss={tr_loss:.6f}  "
-                     f"val R-Hit={val_rhit:.4f}  val dist={val_dist:.2f}cm")
-
-            if val_rhit > best_val_rhit:
-                best_val_rhit = val_rhit
-                best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                no_improve    = 0
-            else:
-                no_improve += 10
-
-            if no_improve >= patience:
-                log.info(f"Early stopping  epoch={epoch}  best val R-Hit={best_val_rhit:.4f}")
-                break
-
-    model.load_state_dict(best_state)
-
-    all_ds     = TrajectoryDataset(train_data, cv_preds_train, residuals_train)
-    all_loader = DataLoader(all_ds, batch_size=512, shuffle=False, num_workers=0)
-    tr_final   = cv_preds_train + predict(model, all_loader)
-    log.info(f"[v6-train] R-Hit={r_hit(tr_final, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(tr_final, true_xyz):.2f}cm  (과적합 참고용)")
-    log.info(f"[v6-val]   R-Hit={best_val_rhit:.4f}  (best)")
+    # 중요도 CSV 저장
+    out_dir = Path("output")
+    out_dir.mkdir(exist_ok=True)
+    imp_df = pd.DataFrame({
+        'feature': feat_names,
+        'importance_x': model.estimators_[0].feature_importances_,
+        'importance_y': model.estimators_[1].feature_importances_,
+        'importance_z': model.estimators_[2].feature_importances_,
+        'importance_mean': importances,
+    }).sort_values('importance_mean', ascending=False)
+    imp_csv = out_dir / "feature_importance_v7.csv"
+    imp_df.to_csv(imp_csv, index=False)
+    log.info(f"\n피처 중요도 전체 저장 → {imp_csv}")
 
     # 제출
-    final_test = cv_preds_test + predict(model, test_loader)
+    final_test = cv_preds_test + model.predict(X_test)
     sub        = pd.read_csv(SAMPLE_SUB)
     pred_map   = {tid: pred for tid, pred in zip(test_ids, final_test)}
-
     for ci, col in enumerate(['x', 'y', 'z']):
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
 
-    out_dir = Path("output")
-    out_dir.mkdir(exist_ok=True)
-    out_sub = out_dir / "submission_bilstm_v6.csv"
+    out_sub = out_dir / "submission_xgb_v7.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)

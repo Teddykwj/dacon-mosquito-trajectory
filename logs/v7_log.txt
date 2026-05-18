@@ -1,0 +1,85 @@
+docker compose up --build
+[+] Building 6.9s (14/14) F
+ => [internal] load   0.0s
+ => => reading from   0.0s
+ => [internal] load   0.0s
+ => => transferring   0.0s
+ => [internal] load   0.0s
+ => [internal] load   0.0s
+ => => transferring   0.0s
+ => [1/7] FROM docke  0.0s
+ => [internal] load   0.4s
+ => CACHED [2/7] WOR  0.0s
+ => CACHED [3/7] COP  0.0s
+ => CACHED [4/7] RUN  0.0s
+ => CACHED [5/7] RUN  0.0s
+ => [6/7] COPY . .    4.8s
+ => [7/7] RUN mkdir   0.3s
+ => exporting to ima  1.2s
+ => => exporting lay  1.2s
+ => => writing image  0.0s
+ => => naming to doc  0.0s
+ => resolving proven  0.0s
+[+] up 2/2
+ ✔ Image test-mosquito       Built 6.9s 
+ ✔ Container test-mosquito-1 Recreated 0.1s 
+Attaching to mosquito-1
+mosquito-1  | 07:26:22  =======================================================
+mosquito-1  | 07:26:22  모 기 비행 궤적 예측 v7 (XGBoost + 피처 확장 + 잔차학습)
+mosquito-1  | 07:26:22  =======================================================
+mosquito-1  | 07:26:30  Train: 10000개  |  Test: 10000개
+mosquito-1  | 07:26:30  [CV-last]  R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 07:26:30  피 처 생성 중...
+mosquito-1  | 07:26:35  피 처 수: 274
+mosquito-1  | 07:26:35  XGBoost 학습 중...
+mosquito-1  | 07:26:54  [v7-val]   R-Hit=0.6140  MeanDist=1.21cm
+mosquito-1  | 07:26:54  [v7-train] R-Hit=0.9075  MeanDist=0.51cm  (과적합 참고용)
+mosquito-1  | 07:26:54  
+mosquito-1  | =======================================================
+mosquito-1  | 07:26:54  Top 40 피처 중요도 (x/y/z 평균)
+mosquito-1  | 07:26:54  =======================================================
+mosquito-1  | 07:26:54     1. vel_x_t8                             0.0145
+mosquito-1  | 07:26:54     2. cv_3_delta_y                         0.0122
+mosquito-1  | 07:26:54     3. speed_delta_t9                       0.0114
+mosquito-1  | 07:26:54     4. recent_vs_overall_z                  0.0114
+mosquito-1  | 07:26:54     5. recent_vs_overall_x                  0.0112
+mosquito-1  | 07:26:54     6. vel_y_t8                             0.0103
+mosquito-1  | 07:26:54     7. cv_3_delta_x                         0.0087
+mosquito-1  | 07:26:54     8. vel_z_t7                             0.0082
+mosquito-1  | 07:26:54     9. cv_1_delta_z                         0.0080
+mosquito-1  | 07:26:54    10. cv_3_delta_z                         0.0077
+mosquito-1  | 07:26:54    11. vel_late_early_z                     0.0075
+mosquito-1  | 07:26:54    12. pos_z_t2                             0.0074
+mosquito-1  | 07:26:54    13. speed_t8                             0.0074
+mosquito-1  | 07:26:54    14. vel_z_t8                             0.0067
+mosquito-1  | 07:26:54    15. kappa_max                            0.0067
+mosquito-1  | 07:26:54    16. cv_all_delta_x                       0.0067
+mosquito-1  | 07:26:54    17. vel_late_early_x                     0.0067
+mosquito-1  | 07:26:54    18. cv_1_delta_y                         0.0066
+mosquito-1  | 07:26:54    19. speed_t7                             0.0065
+mosquito-1  | 07:26:54    20. speed_delta_t7                       0.0064
+mosquito-1  | 07:26:54    21. turn_min                             0.0064
+mosquito-1  | 07:26:54    22. cv_5_delta_x                         0.0063
+mosquito-1  | 07:26:54    23. pos_z_t10                            0.0061
+mosquito-1  | 07:26:54    24. pos_x_t7                             0.0061
+mosquito-1  | 07:26:54    25. kappa_mean                           0.0060
+mosquito-1  | 07:26:54    26. pos_x_t3                             0.0060
+mosquito-1  | 07:26:54    27. pos_y_t9                             0.0060
+mosquito-1  | 07:26:54    28. pos_y_t3                             0.0059
+mosquito-1  | 07:26:54    29. pos_y_t10                            0.0058
+mosquito-1  | 07:26:54    30. speed_t4                             0.0058
+mosquito-1  | 07:26:54    31. pos_z_t5                             0.0058
+mosquito-1  | 07:26:54    32. mean_acc_z                           0.0057
+mosquito-1  | 07:26:54    33. acc_mag_t7                           0.0057
+mosquito-1  | 07:26:54    34. cv_5_delta_z                         0.0057
+mosquito-1  | 07:26:54    35. kappa_t9                             0.0056
+mosquito-1  | 07:26:54    36. cv_1_delta_x                         0.0056
+mosquito-1  | 07:26:54    37. cv_align                             0.0056
+mosquito-1  | 07:26:54    38. pos_x_t0                             0.0056
+mosquito-1  | 07:26:54    39. recent_vs_overall_y                  0.0056
+mosquito-1  | 07:26:54    40. kappa_last                           0.0055
+mosquito-1  | 07:26:54  
+mosquito-1  | 피처 중요도  전체 저장 → output/feature_importance_v7.csv
+mosquito-1  | 07:26:54  제 출 파일 저장 → output/submission_xgb_v7.csv
+mosquito-1  | 07:26:54  완 료
+mosquito-1 exited with code 0
