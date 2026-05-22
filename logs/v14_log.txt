@@ -1,0 +1,166 @@
+docker compose up --build
+w Enable Watch   d Detach
+[+] Building 50.9s (15/15) FINISHED  
+ => [internal] load local bake  0.0s
+ => => reading from stdin 488B  0.0s
+ => [internal] load build defi  0.0s
+ => => transferring docke 489B  0.0s
+ => [internal] load metadata f  0.0s
+ => [internal] load .dockerign  0.0s
+ => => transferring context 2B  0.0s
+ => CACHED [1/8] FROM docker.i  0.0s
+ => [internal] load build cont  0.3s
+ => => transferring c 900.85kB  0.3s
+ => [2/8] RUN apt-get update &  2.7s
+ => [3/8] WORKDIR /app          0.0s 
+ => [4/8] COPY requirements.tx  0.0s 
+ => [5/8] RUN pip install --n  19.3s 
+ => [6/8] RUN pip install --n  20.2s 
+ => [7/8] COPY . .              1.0s 
+ => [8/8] RUN mkdir -p /app/lo  0.2s 
+ => exporting to image          7.1s 
+ => => exporting layers         7.1s 
+ => => writing image sha256:3e  0.0s 
+ => => naming to docker.io/lib  0.0s 
+ => resolving provenance for m  0.0s
+[+] up 2/2
+ ✔ Image test-mosquito       Built 50.9s 
+ ✔ Container test-mosquito-1 Recreated 0.1s 
+Attaching to mosquito-1
+mosquito-1  | 12:15:53  ==================================================================
+mosquito-1  | 12:15:53  모기 비행 궤 적 예측 v14 (XGBoost + LightGBM 5-Fold 앙상블)
+mosquito-1  | 12:15:53  ==================================================================
+mosquito-1  | 12:15:57  Train: 10000 개  |  Test: 10000개
+mosquito-1  | 12:15:57  [CV-last]   R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 12:15:58  [CT-blend]  R-Hit=0.5385  MeanDist=1.40cm  (CT weight 평균: 0.371)
+mosquito-1  | 12:15:58  피처 생성 중...
+mosquito-1  | 12:16:10  피처 수: 377
+mosquito-1  | 12:16:10  5-Fold XGBoost + LightGBM 앙상블 학습 시작...
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | 12:16:37    Fold 1/5  XGB=0.6080  LGB=0.6010  Ensemble=0.6050
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | 12:17:05    Fold 2/5  XGB=0.6095  LGB=0.6020  Ensemble=0.6095
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | 12:17:32    Fold 3/5  XGB=0.5970  LGB=0.5930  Ensemble=0.6065
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | 12:17:59    Fold 4/5  XGB=0.6035  LGB=0.6000  Ensemble=0.6110
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | /usr/local/lib/python3.11/site-packages/sklearn/utils/validation.py:2691: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+mosquito-1  |   warnings.warn(
+mosquito-1  | 12:18:26    Fold 5/5  XGB=0.5970  LGB=0.5840  Ensemble=0.6000
+mosquito-1  | 12:18:26  
+mosquito-1  | [v14-OOF-XGB] R-Hit=0.6030  MeanDist=1.23cm
+mosquito-1  | 12:18:26  [v14-OOF-LGB] R-Hit=0.5960  MeanDist=1.24cm
+mosquito-1  | 12:18:26  [v14-OOF-ENS] R-Hit=0.6064  MeanDist=1.22cm
+mosquito-1  | 12:18:26  
+mosquito-1  | ==================================================================
+mosquito-1  | 12:18:26  Top 50 피처  중요도 (XGB+LGB 5-fold 평균)
+mosquito-1  | 12:18:26  ==================================================================
+mosquito-1  | 12:18:26     1. speed_delta_t9                              76.6038
+mosquito-1  | 12:18:26     2. pos_z_t9                                    50.8677
+mosquito-1  | 12:18:26     3. acc_x_t9                                    49.8376
+mosquito-1  | 12:18:26     4. jerk_x_t9                                   49.1366
+mosquito-1  | 12:18:26     5. speed_delta_t7                              46.4023
+mosquito-1  | 12:18:26     6. speed_delta_t8                              44.3014
+mosquito-1  | 12:18:26     7. spd_delta_mean                              42.0014
+mosquito-1  | 12:18:26     8. pos_y_t9                                    41.1341
+mosquito-1  | 12:18:26     9. vel_r2_x                                    39.9345
+mosquito-1  | 12:18:26    10. jerk_y_t9                                   37.2011
+mosquito-1  | 12:18:26    11. jerk_z_t7                                   34.3010
+mosquito-1  | 12:18:26    12. jerk_z_t9                                   34.1677
+mosquito-1  | 12:18:26    13. jerk_z_t8                                   33.3011
+mosquito-1  | 12:18:26    14. vel_y_t9                                    33.1342
+mosquito-1  | 12:18:26    15. jerk_z_t6                                   31.9676
+mosquito-1  | 12:18:26    16. mean_acc_x                                  31.9358
+mosquito-1  | 12:18:26    17. ct_pred_z                                   31.8755
+mosquito-1  | 12:18:26    18. jerk_y_t7                                   31.8677
+mosquito-1  | 12:18:26    19. speed_ratio                                 31.6682
+mosquito-1  | 12:18:26    20. ct_pred_y                                   31.1083
+mosquito-1  | 12:18:26    21. jerk_y_t8                                   31.0010
+mosquito-1  | 12:18:26    22. vel_z_t9                                    31.0009
+mosquito-1  | 12:18:26    23. ca_pred_x                                   30.9025
+mosquito-1  | 12:18:26    24. speed_slope                                 30.7350
+mosquito-1  | 12:18:26    25. acc_z_t8                                    30.6344
+mosquito-1  | 12:18:26    26. acc_z_t2                                    30.2342
+mosquito-1  | 12:18:26    27. acc_z_t7                                    29.9344
+mosquito-1  | 12:18:26    28. vel_r2_z                                    29.8342
+mosquito-1  | 12:18:26    29. acc_mag_t9                                  29.3352
+mosquito-1  | 12:18:26    30. acc_z_t4                                    29.0009
+mosquito-1  | 12:18:26    31. jerk_z_t5                                   28.9677
+mosquito-1  | 12:18:26    32. a_n_ratio                                   28.7347
+mosquito-1  | 12:18:26    33. acc_z_t1                                    28.7342
+mosquito-1  | 12:18:26    34. vel_z_t0                                    28.3677
+mosquito-1  | 12:18:26    35. acc_z_t6                                    28.1342
+mosquito-1  | 12:18:26    36. acc_y_t7                                    27.9011
+mosquito-1  | 12:18:26    37. acc_x_t1                                    27.2675
+mosquito-1  | 12:18:26    38. kappa_t6                                    27.0681
+mosquito-1  | 12:18:26    39. jerk_x_t8                                   26.7342
+mosquito-1  | 12:18:26    40. jerk_y_t2                                   26.7342
+mosquito-1  | 12:18:26    41. jerk_z_t4                                   26.4343
+mosquito-1  | 12:18:26    42. jerk_y_t4                                   26.4342
+mosquito-1  | 12:18:26    43. acc_z_t5                                    26.4342
+mosquito-1  | 12:18:26    44. kappa_xz_t8                                 26.1677
+mosquito-1  | 12:18:26    45. acc_y_t1                                    26.0008
+mosquito-1  | 12:18:26    46. kappa_xz_t6                                 25.9342
+mosquito-1  | 12:18:26    47. speed_delta_t6                              25.8677
+mosquito-1  | 12:18:26    48. jerk_y_t6                                   25.7010
+mosquito-1  | 12:18:26    49. kappa_xz_t3                                 24.5009
+mosquito-1  | 12:18:26    50. acc_z_t3                                    24.4343
+mosquito-1  | 12:18:26  
+mosquito-1  | 피처 중요도 저장 → output/feature_importance_v14.csv
+mosquito-1  | 12:18:26  제출 파일 저 장 → output/submission_xgb_v14.csv
+mosquito-1  | 12:18:26  완료
+mosquito-1 exited with code 0

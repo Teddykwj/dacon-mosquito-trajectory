@@ -1,5 +1,22 @@
 # Changelog
 
+## v14 (2026-05-22)
+
+### 모델
+- XGBoost 5-Fold + LightGBM 5-Fold 50:50 앙상블
+
+### 결과
+- OOF: XGB 0.6030 / LGB 0.5960 / Ensemble 0.6064
+- Dacon Public: 0.6406 (v13 대비 -0.0014 ↓)
+
+### 분석
+- LightGBM이 동일 하이퍼파라미터에서 XGBoost보다 약함 (OOF -0.007)
+- 50:50 블렌드가 XGBoost 성능을 희석 → public도 하락
+- 피처 중요도 합산 오류: XGB는 gain 비율(0~1), LGB는 split 횟수(정수) → 스케일 불일치로 의미 없는 수치 출력
+- v13(XGBoost 단독 5-Fold) 이 여전히 역대 최고
+
+---
+
 ## v13 (2026-05-22)
 
 ### 모델
