@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.model_selection import KFold
 import xgboost as xgb
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -28,7 +29,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v12_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v13_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -472,7 +473,7 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v12 (XGBoost + CT 물리 모델 블렌드 앵커)")
+    log.info("모기 비행 궤적 예측 v13 (XGBoost + CT 블렌드 + 5-Fold 앙상블)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -515,51 +516,59 @@ def main():
 
     residuals_local = np.einsum('nij,nj->ni', R_train, residuals_train)
 
-    idx     = np.random.RandomState(42).permutation(len(train_data))
-    val_n   = int(len(train_data) * 0.2)
-    val_idx = idx[:val_n];  tr_idx = idx[val_n:]
+    N_FOLDS      = 5
+    kf           = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    oof_preds    = np.zeros_like(true_xyz)
+    test_res_acc = np.zeros((len(test_data), 3))   # 잔차 누적 (fold 평균용)
+    imp_acc      = np.zeros(len(feat_names))
 
-    X_tr,  X_val  = X_train[tr_idx],         X_train[val_idx]
-    y_tr,  y_val  = residuals_local[tr_idx],  residuals_local[val_idx]
-    R_val         = R_train[val_idx]
-    val_blend     = blend_train[val_idx]
-    val_true      = true_xyz[val_idx]
+    log.info(f"5-Fold XGBoost 학습 시작...")
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train), 1):
+        X_tr  = X_train[tr_idx];      X_val = X_train[val_idx]
+        y_tr  = residuals_local[tr_idx]
+        R_val = R_train[val_idx]
+        val_blend_f = blend_train[val_idx]
+        val_true_f  = true_xyz[val_idx]
 
-    base_xgb = xgb.XGBRegressor(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.7,
-        min_child_weight=3,
-        tree_method='hist',
-        random_state=42,
-        n_jobs=-1,
-        verbosity=0,
-    )
-    model = MultiOutputRegressor(base_xgb, n_jobs=1)
+        base_xgb = xgb.XGBRegressor(
+            n_estimators=500,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.7,
+            min_child_weight=3,
+            tree_method='hist',
+            random_state=42,
+            n_jobs=-1,
+            verbosity=0,
+        )
+        model = MultiOutputRegressor(base_xgb, n_jobs=1)
+        model.fit(X_tr, y_tr)
 
-    log.info("XGBoost 학습 중...")
-    model.fit(X_tr, y_tr)
+        # OOF 예측
+        val_res_local  = model.predict(X_val)
+        val_res_global = np.einsum('nji,nj->ni', R_val, val_res_local)
+        oof_preds[val_idx] = val_blend_f + val_res_global
+        fold_hit = r_hit(oof_preds[val_idx], val_true_f)
+        log.info(f"  Fold {fold}/{N_FOLDS}  R-Hit={fold_hit:.4f}")
 
-    val_res_local  = model.predict(X_val)
-    val_res_global = np.einsum('nji,nj->ni', R_val, val_res_local)
-    val_preds      = val_blend + val_res_global
-    log.info(f"[v12-val]   R-Hit={r_hit(val_preds, val_true):.4f}  "
-             f"MeanDist={mean_dist_cm(val_preds, val_true):.2f}cm")
+        # 테스트 잔차 누적
+        test_res_local  = model.predict(X_test)
+        test_res_global = np.einsum('nji,nj->ni', R_test, test_res_local)
+        test_res_acc   += test_res_global
 
-    tr_res_local  = model.predict(X_train)
-    tr_res_global = np.einsum('nji,nj->ni', R_train, tr_res_local)
-    tr_preds      = blend_train + tr_res_global
-    log.info(f"[v12-train] R-Hit={r_hit(tr_preds, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(tr_preds, true_xyz):.2f}cm  (과적합 참고용)")
+        # 피처 중요도 누적
+        imp_acc += np.array(
+            [est.feature_importances_ for est in model.estimators_]
+        ).mean(axis=0)
 
-    importances = np.array(
-        [est.feature_importances_ for est in model.estimators_]
-    ).mean(axis=0)
+    log.info(f"\n[v13-OOF]   R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
+
+    importances = imp_acc / N_FOLDS
     top_idx = np.argsort(importances)[::-1][:50]
     log.info(f"\n{'='*66}")
-    log.info("Top 50 피처 중요도 (x/y/z 평균)")
+    log.info("Top 50 피처 중요도 (5-fold 평균)")
     log.info(f"{'='*66}")
     for rank, i in enumerate(top_idx, 1):
         name = feat_names[i] if i < len(feat_names) else f"feat_{i}"
@@ -569,17 +578,12 @@ def main():
     out_dir.mkdir(exist_ok=True)
     pd.DataFrame({
         'feature':         feat_names,
-        'importance_x':    model.estimators_[0].feature_importances_,
-        'importance_y':    model.estimators_[1].feature_importances_,
-        'importance_z':    model.estimators_[2].feature_importances_,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v12.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v12.csv")
+        out_dir / "feature_importance_v13.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v13.csv")
 
-    test_res_local  = model.predict(X_test)
-    test_res_global = np.einsum('nji,nj->ni', R_test, test_res_local)
-    final_test      = blend_test + test_res_global
+    final_test = blend_test + test_res_acc / N_FOLDS
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -587,7 +591,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v12.csv"
+    out_sub = out_dir / "submission_xgb_v13.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
