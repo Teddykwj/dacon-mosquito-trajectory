@@ -1,5 +1,34 @@
 # Changelog
 
+## v12 (2026-05-22)
+
+### 모델
+- XGBoost + CT(Constant Turn Rate) 물리 모델 블렌드 앵커
+- 잔차 기준: `true - cv_last` → `true - physics_blend`
+
+### CT 모델 원리
+- 현재 각속도 ω = a_n / speed (rad/s)로 원호 경로 예측
+- 선회각 theta = ω × 0.08s 기반 CT 신뢰도(ct_weight) 계산
+- `blend = (1 - ct_weight) × cv_pred + ct_weight × ct_pred`
+- 직진 중 → CT weight ≈ 0 (CV 그대로), 강한 선회 → CT weight → 1
+
+### 피처 변경 (364 → 377개, +13)
+- ct_pred_L (3): CT 예측 로컬 변위
+- ct_vs_cv_L (3): CT - CV 차이 (선회 보정량)
+- ct_weight (1): 선회 강도 기반 CT 신뢰도
+- (기타 내부 계산 피처 6개 추가)
+
+### 주요 발견
+- CT-blend 앵커 자체 R-Hit: 0.5385 (CV 0.5788보다 낮음)
+- 그러나 CT 피처 중요도 2위(ct_pred_z), 3위(ct_pred_y), 4위(ct_vs_cv_z)
+- 앵커가 나빠도 XGBoost가 CT 방향 정보를 활용해 더 정확히 보정
+- CT weight 평균 0.371 → 데이터의 약 37%가 의미 있는 선회 구간
+
+### 결과
+- Dacon Public: 0.6334 (v10 대비 +0.0018 ↑, 역대 최고)
+
+---
+
 ## v11 (2026-05-22)
 
 ### 모델

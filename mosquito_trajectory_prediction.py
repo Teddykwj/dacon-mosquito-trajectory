@@ -28,7 +28,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v11_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v12_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -54,6 +54,55 @@ def predict_cv_last(traj: np.ndarray) -> np.ndarray:
 
 def batch_cv_last(data: list[np.ndarray]) -> np.ndarray:
     return np.array([predict_cv_last(t) for t in data])
+
+
+# ── CT (Constant Turn Rate) 물리 모델 ──────────────────────────────────────────
+def predict_ct(traj: np.ndarray) -> tuple[np.ndarray, float]:
+    """등속 선회율(CT) 모델: 현재 각속도 ω로 원호 경로를 예측.
+    Returns (ct_pred_global, ct_weight) — ct_weight는 선회 강도 기반 신뢰도.
+    """
+    eps   = 1e-8
+    dt    = DT * HORIZON
+    vels_g = np.diff(traj, axis=0) / DT
+    R      = _local_frame_rotation(vels_g[-1])
+    vels   = vels_g @ R.T
+    accs_r = np.diff(vels, axis=0) / DT   # (9, 3) 로컬 가속도
+
+    speed  = float(np.linalg.norm(vels[-1]))
+    v_unit = vels[-1] / (speed + eps)
+
+    # 법선 가속도 벡터 (접선 성분 제거)
+    a_t_val = float(np.dot(accs_r[-1], v_unit))
+    a_n_vec = accs_r[-1] - a_t_val * v_unit
+    a_n_mag = float(np.linalg.norm(a_n_vec))
+
+    omega   = a_n_mag / (speed + eps)   # rad/s
+    theta   = omega * dt                # 80ms 동안 회전각
+
+    if omega < 1e-6 or speed < 1e-6:
+        ct_L = vels[-1] * dt            # 퇴화 → CV와 동일
+    else:
+        R_curve = speed / (omega + eps)
+        n_hat   = a_n_vec / (a_n_mag + eps)
+        # 원호 위치: 전진 성분 + 법선 성분
+        ct_L = R_curve * np.sin(theta) * v_unit + R_curve * (1 - np.cos(theta)) * n_hat
+
+    ct_pred = traj[-1] + ct_L @ R      # 로컬 → 글로벌
+
+    # 신뢰도: 회전각이 클수록 CT가 CV보다 유리 (45도에서 포화)
+    ct_weight = float(np.clip(theta / (np.pi / 4), 0.0, 1.0))
+    return ct_pred, ct_weight
+
+
+def batch_physics_blend(data: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """CV + CT 적응 블렌드 앵커. Returns (blend, cv_preds, ct_weights)."""
+    cv_preds  = np.array([predict_cv_last(t) for t in data])
+    ct_results = [predict_ct(t) for t in data]
+    ct_preds  = np.array([r[0] for r in ct_results])
+    ct_weights = np.array([r[1] for r in ct_results])          # (N,)
+    w = ct_weights[:, None]                                      # (N, 1) for broadcast
+    blend = (1 - w) * cv_preds + w * ct_preds
+    return blend, cv_preds, ct_weights
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -92,7 +141,8 @@ def _vel_r2(vels: np.ndarray) -> np.ndarray:
 
 # ── Feature engineering ────────────────────────────────────────────────────────
 def make_xgb_features(traj: np.ndarray,
-                       cv_pred: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                       cv_pred: np.ndarray,
+                       ct_weight: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
     vels_g = np.diff(traj, axis=0) / DT
     R      = _local_frame_rotation(vels_g[-1])
 
@@ -216,6 +266,11 @@ def make_xgb_features(traj: np.ndarray,
     kappa_trend   = kappa[-3:].mean()   - kappa[1:7].mean()
     speed_ratio   = speed[-1] / (speed.mean() + 1e-8)
 
+    # ── [NEW] CT 모델 피처 ───────────────────────────────────────────────────
+    ct_pred_global, _  = predict_ct(traj)
+    ct_pred_L          = (ct_pred_global - traj[-1]) @ R.T   # 로컬 변위
+    ct_vs_cv_L         = ct_pred_L - cv_L                    # CT - CV 차이
+
     feats = np.concatenate([
         # ── 기존 시계열 ──────────────────────────────────────────────────────
         vels.flatten(),           # (30)
@@ -294,6 +349,11 @@ def make_xgb_features(traj: np.ndarray,
         vels[-3:].mean(0) - vels.mean(0),
         accs[1:].mean(0), accs[-3:].mean(0),
         [turn_trend], [kappa_trend], [speed_ratio],
+
+        # ── [NEW] CT 모델 피처 ───────────────────────────────────────────────
+        ct_pred_L,              # (3) CT 예측 로컬 변위
+        ct_vs_cv_L,             # (3) CT - CV 차이 (선회 보정량)
+        [ct_weight],            # (1) 선회 강도 기반 CT 신뢰도
     ])
     return feats.astype(np.float32), R
 
@@ -391,6 +451,11 @@ def make_feature_names() -> list[str]:
     for ax in axes: N.append(f"mean_acc_{ax}")
     for ax in axes: N.append(f"recent_acc_{ax}")
     N += ["turn_trend","kappa_trend","speed_ratio"]
+
+    # [NEW] CT 모델 피처
+    for ax in axes: N.append(f"ct_pred_{ax}")
+    for ax in axes: N.append(f"ct_vs_cv_{ax}")
+    N += ["ct_weight"]
     return N
 
 
@@ -407,7 +472,7 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v11 (XGBoost + ω·부호곡률·등가속도 등)")
+    log.info("모기 비행 궤적 예측 v12 (XGBoost + CT 물리 모델 블렌드 앵커)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -417,23 +482,31 @@ def main():
     labels   = pd.read_csv(LABELS_CSV, index_col='id')
     true_xyz = labels.loc[train_ids, ['x', 'y', 'z']].values
 
+    # ── 물리 모델 앵커 계산 ────────────────────────────────────────────────────
     cv_preds_train = batch_cv_last(train_data)
     cv_preds_test  = batch_cv_last(test_data)
-    log.info(f"[CV-last]  R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
+    log.info(f"[CV-last]   R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    residuals_train = true_xyz - cv_preds_train
+    blend_train, _, ct_w_train = batch_physics_blend(train_data)
+    blend_test,  _, _          = batch_physics_blend(test_data)
+    log.info(f"[CT-blend]  R-Hit={r_hit(blend_train, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(blend_train, true_xyz):.2f}cm  "
+             f"(CT weight 평균: {ct_w_train.mean():.3f})")
+
+    residuals_train = true_xyz - blend_train   # 블렌드 앵커 기준 잔차
 
     log.info("피처 생성 중...")
-    train_out  = [make_xgb_features(t, cv)
-                  for t, cv in zip(train_data, cv_preds_train)]
-    X_train    = np.array([o[0] for o in train_out])
-    R_train    = np.array([o[1] for o in train_out])
+    train_out = [make_xgb_features(t, cv, cw)
+                 for t, cv, cw in zip(train_data, cv_preds_train, ct_w_train)]
+    X_train   = np.array([o[0] for o in train_out])
+    R_train   = np.array([o[1] for o in train_out])
 
-    test_out   = [make_xgb_features(t, cv)
-                  for t, cv in zip(test_data, cv_preds_test)]
-    X_test     = np.array([o[0] for o in test_out])
-    R_test     = np.array([o[1] for o in test_out])
+    ct_w_test = np.array([predict_ct(t)[1] for t in test_data])
+    test_out  = [make_xgb_features(t, cv, cw)
+                 for t, cv, cw in zip(test_data, cv_preds_test, ct_w_test)]
+    X_test    = np.array([o[0] for o in test_out])
+    R_test    = np.array([o[1] for o in test_out])
 
     feat_names = make_feature_names()
     log.info(f"피처 수: {X_train.shape[1]}")
@@ -449,7 +522,7 @@ def main():
     X_tr,  X_val  = X_train[tr_idx],         X_train[val_idx]
     y_tr,  y_val  = residuals_local[tr_idx],  residuals_local[val_idx]
     R_val         = R_train[val_idx]
-    val_cv        = cv_preds_train[val_idx]
+    val_blend     = blend_train[val_idx]
     val_true      = true_xyz[val_idx]
 
     base_xgb = xgb.XGBRegressor(
@@ -471,14 +544,14 @@ def main():
 
     val_res_local  = model.predict(X_val)
     val_res_global = np.einsum('nji,nj->ni', R_val, val_res_local)
-    val_preds      = val_cv + val_res_global
-    log.info(f"[v11-val]   R-Hit={r_hit(val_preds, val_true):.4f}  "
+    val_preds      = val_blend + val_res_global
+    log.info(f"[v12-val]   R-Hit={r_hit(val_preds, val_true):.4f}  "
              f"MeanDist={mean_dist_cm(val_preds, val_true):.2f}cm")
 
     tr_res_local  = model.predict(X_train)
     tr_res_global = np.einsum('nji,nj->ni', R_train, tr_res_local)
-    tr_preds      = cv_preds_train + tr_res_global
-    log.info(f"[v11-train] R-Hit={r_hit(tr_preds, true_xyz):.4f}  "
+    tr_preds      = blend_train + tr_res_global
+    log.info(f"[v12-train] R-Hit={r_hit(tr_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(tr_preds, true_xyz):.2f}cm  (과적합 참고용)")
 
     importances = np.array(
@@ -501,12 +574,12 @@ def main():
         'importance_z':    model.estimators_[2].feature_importances_,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v11.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v11.csv")
+        out_dir / "feature_importance_v12.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v12.csv")
 
     test_res_local  = model.predict(X_test)
     test_res_global = np.einsum('nji,nj->ni', R_test, test_res_local)
-    final_test      = cv_preds_test + test_res_global
+    final_test      = blend_test + test_res_global
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -514,7 +587,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v11.csv"
+    out_sub = out_dir / "submission_xgb_v12.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
