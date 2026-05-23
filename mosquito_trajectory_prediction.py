@@ -30,7 +30,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v15_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v16_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -472,6 +472,130 @@ def make_feature_names() -> list[str]:
     return N
 
 
+# ── Error analysis ────────────────────────────────────────────────────────────
+def compute_traj_stats(traj: np.ndarray, ct_weight: float) -> dict:
+    """궤적 하나에서 해석 가능한 통계를 계산."""
+    eps = 1e-8
+    vels_g = np.diff(traj, axis=0) / DT          # (10, 3) 글로벌 속도
+    speed  = np.linalg.norm(vels_g, axis=1)       # (10,)
+
+    # 곡률
+    accs_g = np.diff(vels_g, axis=0) / DT         # (9, 3)
+    kappa_last = 0.0
+    if speed[-1] > eps:
+        cross = np.cross(vels_g[-1], accs_g[-1])
+        kappa_last = float(np.linalg.norm(cross) / (speed[-1]**3 + eps))
+
+    # 마지막 방향 전환
+    turn_cos_last = 1.0
+    if speed[-1] > eps and speed[-2] > eps:
+        turn_cos_last = float(np.dot(vels_g[-1], vels_g[-2]) /
+                              (speed[-1] * speed[-2] + eps))
+
+    # 속력 추세 (양수=가속, 음수=감속)
+    speed_trend = float(np.polyfit(np.arange(10), speed, 1)[0])
+
+    path_len     = float(np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1)))
+    straightness = float(np.linalg.norm(traj[-1] - traj[0]) / (path_len + eps))
+
+    return {
+        'speed_last':    float(speed[-1]),
+        'speed_mean':    float(speed.mean()),
+        'speed_trend':   speed_trend,
+        'kappa_last':    kappa_last,
+        'turn_cos_last': turn_cos_last,
+        'straightness':  straightness,
+        'ct_weight':     ct_weight,
+    }
+
+
+def run_error_analysis(log, train_data, true_xyz, oof_preds,
+                       cv_preds_train, blend_train, ct_w_train,
+                       train_ids, out_dir):
+    """OOF 에러 분석 — 궤적 패턴별 실패 원인 분해."""
+    n = len(train_data)
+    errors_cm = np.linalg.norm(oof_preds - true_xyz, axis=1) * 100
+    cv_errs   = np.linalg.norm(cv_preds_train - true_xyz, axis=1) * 100
+    bl_errs   = np.linalg.norm(blend_train    - true_xyz, axis=1) * 100
+    hits      = errors_cm <= 1.0
+
+    # 궤적 통계 계산
+    stats_rows = [compute_traj_stats(train_data[i], float(ct_w_train[i]))
+                  for i in range(n)]
+    df = pd.DataFrame(stats_rows)
+    df['id']          = train_ids
+    df['error_cm']    = errors_cm
+    df['cv_error_cm'] = cv_errs
+    df['bl_error_cm'] = bl_errs
+    df['hit']         = hits.astype(int)
+    df['improvement_vs_cv']    = cv_errs  - errors_cm   # 양수 = 개선
+    df['improvement_vs_blend'] = bl_errs  - errors_cm
+
+    # ── 저장 ──────────────────────────────────────────────────────────────────
+    save_path = out_dir / "oof_analysis_v16.csv"
+    df.to_csv(save_path, index=False)
+    log.info(f"\nOOF 분석 저장 → {save_path}")
+
+    # ── 에러 분포 ─────────────────────────────────────────────────────────────
+    pcts = np.percentile(errors_cm, [25, 50, 75, 90, 95, 99])
+    log.info("\n[에러 분포 (cm)]")
+    log.info(f"  p25={pcts[0]:.2f}  p50={pcts[1]:.2f}  p75={pcts[2]:.2f}"
+             f"  p90={pcts[3]:.2f}  p95={pcts[4]:.2f}  p99={pcts[5]:.2f}")
+    log.info(f"  R-Hit@1cm={hits.mean():.4f}  (mean={errors_cm.mean():.2f}cm"
+             f"  max={errors_cm.max():.2f}cm)")
+
+    # ── 속력 구간별 분석 ──────────────────────────────────────────────────────
+    log.info("\n[속력 구간별 R-Hit]  (speed_last 기준 5분위)")
+    speed_q = pd.qcut(df['speed_last'], 5, labels=['Q1(느림)','Q2','Q3','Q4','Q5(빠름)'])
+    for grp, sub in df.groupby(speed_q, observed=True):
+        log.info(f"  {grp}: R-Hit={sub['hit'].mean():.3f}  "
+                 f"mean_err={sub['error_cm'].mean():.2f}cm  n={len(sub)}")
+
+    # ── 곡률 구간별 분석 ──────────────────────────────────────────────────────
+    log.info("\n[곡률 구간별 R-Hit]  (kappa_last 기준 5분위)")
+    kappa_q = pd.qcut(df['kappa_last'], 5, labels=['Q1(직진)','Q2','Q3','Q4','Q5(급선회)'])
+    for grp, sub in df.groupby(kappa_q, observed=True):
+        log.info(f"  {grp}: R-Hit={sub['hit'].mean():.3f}  "
+                 f"mean_err={sub['error_cm'].mean():.2f}cm  n={len(sub)}")
+
+    # ── CT weight 구간별 분석 ─────────────────────────────────────────────────
+    log.info("\n[CT weight 구간별 R-Hit]  (선회 강도)")
+    ct_bins  = [0.0, 0.1, 0.3, 0.6, 1.01]
+    ct_labels = ['직진(0~0.1)', '약선회(0.1~0.3)', '중선회(0.3~0.6)', '강선회(0.6~1.0)']
+    ct_q = pd.cut(df['ct_weight'], bins=ct_bins, labels=ct_labels, include_lowest=True)
+    for grp, sub in df.groupby(ct_q, observed=True):
+        log.info(f"  {grp}: R-Hit={sub['hit'].mean():.3f}  "
+                 f"mean_err={sub['error_cm'].mean():.2f}cm  n={len(sub)}")
+
+    # ── 속력 추세별 분석 (가속/감속) ─────────────────────────────────────────
+    log.info("\n[속력 추세별 R-Hit]")
+    trend_q = pd.qcut(df['speed_trend'], 3, labels=['감속','등속','가속'])
+    for grp, sub in df.groupby(trend_q, observed=True):
+        log.info(f"  {grp}: R-Hit={sub['hit'].mean():.3f}  "
+                 f"mean_err={sub['error_cm'].mean():.2f}cm  n={len(sub)}")
+
+    # ── CV-last 대비 개선/악화 분석 ───────────────────────────────────────────
+    improved  = df['improvement_vs_cv'] > 0.05
+    worsened  = df['improvement_vs_cv'] < -0.05
+    log.info(f"\n[CV-last 대비]")
+    log.info(f"  개선된 샘플: {improved.sum()}개 ({improved.mean()*100:.1f}%)  "
+             f"평균 개선량={df.loc[improved,'improvement_vs_cv'].mean():.2f}cm")
+    log.info(f"  악화된 샘플: {worsened.sum()}개 ({worsened.mean()*100:.1f}%)  "
+             f"평균 악화량={-df.loc[worsened,'improvement_vs_cv'].mean():.2f}cm")
+
+    # ── 최악 샘플 특성 ────────────────────────────────────────────────────────
+    top_bad = df.nlargest(200, 'error_cm')
+    log.info(f"\n[최악 200개 샘플 평균 특성]  (error_cm 기준)")
+    log.info(f"  speed_last={top_bad['speed_last'].mean():.2f}  "
+             f"kappa_last={top_bad['kappa_last'].mean():.4f}  "
+             f"ct_weight={top_bad['ct_weight'].mean():.3f}")
+    log.info(f"  straightness={top_bad['straightness'].mean():.3f}  "
+             f"turn_cos_last={top_bad['turn_cos_last'].mean():.3f}")
+    log.info(f"  전체 대비: speed={df['speed_last'].mean():.2f}  "
+             f"kappa={df['kappa_last'].mean():.4f}  "
+             f"ct_w={df['ct_weight'].mean():.3f}")
+
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 def r_hit(preds: np.ndarray, trues: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(preds - trues, axis=1) <= 0.01))
@@ -485,7 +609,7 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v15 (XGBoost + CT 블렌드 + 3D 회전 증강 + 5-Fold)")
+    log.info("모기 비행 궤적 예측 v16 (v15 + OOF 에러 분석)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -602,8 +726,14 @@ def main():
         imp_acc        += np.array([e.feature_importances_
                                     for e in model.estimators_]).mean(0)
 
-    log.info(f"\n[v15-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v16-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
+
+    out_dir = Path("output")
+    out_dir.mkdir(exist_ok=True)
+    run_error_analysis(log, train_data, true_xyz, oof_preds,
+                       cv_preds_train, blend_train, ct_w_train,
+                       train_ids, out_dir)
 
     final_test = blend_test + test_res_acc / N_FOLDS
 
@@ -616,14 +746,12 @@ def main():
         name = feat_names[i] if i < len(feat_names) else f"feat_{i}"
         log.info(f"  {rank:2d}. {name:<42s}  {importances[i]:.4f}")
 
-    out_dir = Path("output")
-    out_dir.mkdir(exist_ok=True)
     pd.DataFrame({
         'feature':         feat_names,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v15.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v15.csv")
+        out_dir / "feature_importance_v16.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v16.csv")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -631,7 +759,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v15.csv"
+    out_sub = out_dir / "submission_xgb_v16.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
