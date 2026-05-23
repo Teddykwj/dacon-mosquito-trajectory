@@ -155,25 +155,103 @@ R² = 1 - (선형피팅 오차) / (전체 분산)
 
 ---
 
-## 9. main() 6단계 흐름
+## 9. CT 모델 (Constant Turn Rate)
+
+**핵심 아이디어:** 모기가 현재 각속도로 원호를 그리며 계속 선회한다고 가정해 예측.
+
+```
+ω = a_n / speed   (각속도, rad/s)
+               └ 법선가속도 ÷ 속력 = 곡률 반지름의 역수
+
+선회각 θ = ω × 0.08s
+ct_weight = clip(θ / (π/4), 0, 1)
+         → 약선회(직진) 시 ≈ 0, 강선회 시 → 1
+
+blend = (1 - ct_weight) × cv_pred + ct_weight × ct_pred
+```
+
+**핵심 발견:** CT 블렌드 앵커 자체 R-Hit은 0.5385 (CV 0.5788보다 낮음). 하지만 CT 피처(ct_pred, ct_vs_cv)를 XGBoost 입력으로 넣으면 선회 방향 정보를 활용해 최종 예측이 향상됨 → CT 피처 중요도 상위권 진입.
+
+---
+
+## 10. 5-Fold 교차검증 앙상블
+
+**단일 8:2 분할의 한계:** 2,000개 val 데이터가 학습에 참여 못함.
+
+```
+5-Fold: 전체 10,000개를 5등분
+  → 각 Fold에서 8,000개 학습, 2,000개 검증
+  → 5개 모델의 test 예측을 평균
+  → OOF(Out-Of-Fold) 점수 = 전체 데이터의 신뢰도 높은 검증
+```
+
+v13부터 도입. OOF 0.6030 → Dacon Public 0.6420.
+
+---
+
+## 11. 3D 회전 증강 (v15)
+
+### 핵심 아이디어
+
+모기 궤적 예측은 **방향에 무관해야 한다** — 동일한 비행 패턴이 북쪽으로 날든 동쪽으로 날든 예측 정확도가 같아야 한다. XGBoost는 이 회전 불변성을 스스로 학습하지 못하므로 데이터를 다양한 방향으로 회전시켜 직접 가르친다.
+
+### 랜덤 회전행렬 생성 (QR 분해)
+```python
+H = rng.randn(3, 3)
+Q, R = np.linalg.qr(H)
+Q = Q * np.sign(np.diag(R))   # 부호 보정
+if det(Q) < 0: Q[:,0] *= -1   # 반사 제거 → SO(3) 보장
+```
+QR 분해를 쓰는 이유: 3D 공간에 균일하게 분포된 랜덤 회전행렬을 얻기 위해.
+
+### 증강 과정
+```
+동일한 Q로 궤적 전체를 회전:
+  traj_rot  = (Q @ traj.T).T   ← 11개 관측점 전부 회전
+  true_rot  = Q @ true_xyz     ← 정답 위치도 동일하게 회전
+  blend_rot = Q @ blend        ← 앵커(CV+CT 블렌드)도 회전
+
+ct_weight는 ω = a_n/speed (크기만 사용) → 회전해도 불변 → 재사용
+
+N_AUG = 4 → 10,000 × (1+4) = 50,000개
+```
+
+### 누수 방지 Fold 설계
+```
+val   = 원본 인덱스만  (증강본 포함 금지)
+train = 원본(val 제외) + 증강 4벌(val 원본의 증강본도 제외)
+```
+같은 궤적의 회전본이 train과 val에 동시에 들어가면 데이터 누수 → 원본이 val에 있으면 그 궤적의 모든 증강본도 train에서 제외.
+
+### 효과
+| | v13 | v15 |
+|--|-----|-----|
+| 학습 데이터 | 10,000 | 50,000 |
+| OOF R-Hit | 0.6030 | 0.6134 |
+| Dacon Public | 0.6420 | 0.6456 |
+
+---
+
+## 12. main() 흐름 (v15 최신)
 
 ```
 ① 데이터 로드
    train_data (10000, 11, 3) + 정답 true_xyz (10000, 3)
 
-② CV-last 베이스라인 계산
-   residuals = true_xyz - cv_preds  ← XGBoost 타깃
+② 물리 앵커 계산
+   blend = (1-ct_w)*cv_pred + ct_w*ct_pred
+   residuals = true_xyz - blend
 
 ③ 피처 생성
-   X_train (10000, 364)  R_train (10000, 3, 3)
+   X_train (10000, 377)  R_train (10000, 3, 3)
 
-④ 8:2 분할 + 잔차 로컬화
-   residuals_local = R @ residuals
+④ 3D 회전 증강 (N_AUG=4)
+   X_all (50000, 377)  →  학습 데이터 5배 확장
 
-⑤ XGBoost 학습 + 검증
-   model.fit(X_tr, y_tr)
-   val_preds = val_cv + R.T @ model.predict(X_val)
+⑤ 5-Fold CV (누수 방지 설계)
+   val = 원본만, train = 원본+증강
+   OOF 예측 누적
 
 ⑥ 피처 중요도 저장 + 제출 파일 생성
-   final_test = cv_preds_test + R.T @ model.predict(X_test)
+   final_test = blend_test + (5개 모델 예측 평균)
 ```
