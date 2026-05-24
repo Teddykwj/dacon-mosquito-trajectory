@@ -30,7 +30,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v16_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v17_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -532,7 +532,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v16.csv"
+    save_path = out_dir / "oof_analysis_v17.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -609,7 +609,7 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v16 (v15 + OOF 에러 분석)")
+    log.info("모기 비행 궤적 예측 v17 (v15 + 속력 기반 잔차 정규화)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -633,6 +633,15 @@ def main():
 
     residuals_train = true_xyz - blend_train   # 블렌드 앵커 기준 잔차
 
+    # ── 속력 기반 잔차 정규화 스케일 ──────────────────────────────────────────
+    # 빠른 샘플과 느린 샘플의 잔차 크기를 통일 → 학습 신호 균형
+    # speed * dt = 예상 이동거리 (cm), 회전에 불변 → 증강에서도 재사용 가능
+    speed_train = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in train_data])
+    disp_scale_train = np.maximum(speed_train * DT * HORIZON, 0.01)   # (N,) cm
+
+    speed_test = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in test_data])
+    disp_scale_test = np.maximum(speed_test * DT * HORIZON, 0.01)     # (N,) cm
+
     log.info("피처 생성 중...")
     train_out = [make_xgb_features(t, cv, cw)
                  for t, cv, cw in zip(train_data, cv_preds_train, ct_w_train)]
@@ -651,6 +660,8 @@ def main():
         f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
 
     residuals_local = np.einsum('nij,nj->ni', R_train, residuals_train)
+    # 속력 정규화: 잔차를 예상 이동거리로 나눔 (무차원 비율)
+    residuals_local_norm = residuals_local / disp_scale_train[:, None]
 
     # ── 3D 회전 증강 ──────────────────────────────────────────────────────────
     N_AUG   = 4
@@ -662,6 +673,7 @@ def main():
     all_R     = [R_train]
     all_blend = [blend_train]
     all_true  = [true_xyz]
+    all_scale = [disp_scale_train]   # 회전 불변 → 증강마다 원본 스케일 재사용
 
     for _ in range(N_AUG):
         Q_batch  = np.array([_random_rotation(rng_aug) for _ in range(n_orig)])
@@ -676,13 +688,16 @@ def main():
         all_R.append(np.array([o[1] for o in aug_out]))
         all_blend.append(blend_rot)
         all_true.append(true_rot)
+        all_scale.append(disp_scale_train)   # 속력 크기는 회전에 불변
 
-    X_all       = np.concatenate(all_X,     axis=0)   # (n_orig*(N_AUG+1), F)
-    R_all       = np.concatenate(all_R,     axis=0)
-    blend_all   = np.concatenate(all_blend, axis=0)
-    true_all    = np.concatenate(all_true,  axis=0)
-    res_all     = true_all - blend_all
-    res_loc_all = np.einsum('nij,nj->ni', R_all, res_all)
+    X_all         = np.concatenate(all_X,     axis=0)   # (n_orig*(N_AUG+1), F)
+    R_all         = np.concatenate(all_R,     axis=0)
+    blend_all     = np.concatenate(all_blend, axis=0)
+    true_all      = np.concatenate(all_true,  axis=0)
+    disp_scale_all = np.concatenate(all_scale, axis=0)  # (n_orig*(N_AUG+1),)
+    res_all       = true_all - blend_all
+    res_loc_all   = np.einsum('nij,nj->ni', R_all, res_all)
+    res_loc_all_norm = res_loc_all / disp_scale_all[:, None]  # 정규화
     log.info(f"증강 완료: X_all {X_all.shape}")
 
     # ── 5-Fold (val=원본만, train=원본+증강) ──────────────────────────────────
@@ -705,7 +720,7 @@ def main():
             tr_orig_idx + n_orig * r for r in range(N_AUG + 1)
         ])
         X_tr = X_all[tr_aug_idx]
-        y_tr = res_loc_all[tr_aug_idx]
+        y_tr = res_loc_all_norm[tr_aug_idx]   # 정규화된 타깃 학습
 
         model = MultiOutputRegressor(xgb.XGBRegressor(
             n_estimators=500, max_depth=6, learning_rate=0.05,
@@ -714,19 +729,22 @@ def main():
         ), n_jobs=1)
         model.fit(X_tr, y_tr)
 
-        val_res_local  = model.predict(X_val)
-        val_res_global = np.einsum('nji,nj->ni', R_val, val_res_local)
+        # val: 정규화 예측 → 역정규화 (× val 샘플의 속력 스케일)
+        val_scale       = disp_scale_train[val_orig_idx][:, None]
+        val_res_local   = model.predict(X_val) * val_scale
+        val_res_global  = np.einsum('nji,nj->ni', R_val, val_res_local)
         oof_preds[val_orig_idx] = val_blend_f + val_res_global
         fold_hit = r_hit(oof_preds[val_orig_idx], val_true_f)
         log.info(f"  Fold {fold}/{N_FOLDS}  R-Hit={fold_hit:.4f}  "
                  f"(train {len(X_tr):,}개)")
 
-        test_res_local  = model.predict(X_test)
+        # test: 역정규화 (× test 샘플의 속력 스케일)
+        test_res_local  = model.predict(X_test) * disp_scale_test[:, None]
         test_res_acc   += np.einsum('nji,nj->ni', R_test, test_res_local)
         imp_acc        += np.array([e.feature_importances_
                                     for e in model.estimators_]).mean(0)
 
-    log.info(f"\n[v16-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v17-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
     out_dir = Path("output")
@@ -750,8 +768,8 @@ def main():
         'feature':         feat_names,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v16.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v16.csv")
+        out_dir / "feature_importance_v17.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v17.csv")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -759,7 +777,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v16.csv"
+    out_sub = out_dir / "submission_xgb_v17.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
