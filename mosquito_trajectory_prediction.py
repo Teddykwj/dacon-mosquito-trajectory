@@ -30,7 +30,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v20_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v21_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -583,7 +583,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v20.csv"
+    save_path = out_dir / "oof_analysis_v21.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -672,17 +672,30 @@ def train_group(log, label,
 
     for _ in range(N_AUG):
         Q_batch   = np.array([_random_rotation(rng) for _ in range(n)])
+        s_batch   = rng.uniform(0.5, 2.0, size=n)          # [v21] 속력 스케일
+
         trajs_rot = [(Q_batch[i] @ train_data_g[i].T).T for i in range(n)]
+        last_rot  = np.array([t[-1] for t in trajs_rot])   # (n, 3)
         true_rot  = np.einsum('nij,nj->ni', Q_batch, true_xyz_g)
         blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_g)
         cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_preds_g)
+
+        # [v21] 마지막 위치 기준 상대 거리 스케일 (방향 유지, 속력 변경)
+        s = s_batch[:, None]
+        trajs_aug = [last_rot[i] + (trajs_rot[i] - last_rot[i]) * s_batch[i]
+                     for i in range(n)]
+        true_aug  = last_rot + (true_rot  - last_rot) * s
+        blend_aug = last_rot + (blend_rot - last_rot) * s
+        cv_aug    = last_rot + (cv_rot    - last_rot) * s
+        disp_aug  = disp_scale_g * s_batch
+
         aug_out   = [make_xgb_features(t, cv, cw)
-                     for t, cv, cw in zip(trajs_rot, cv_rot, ct_w_g)]
+                     for t, cv, cw in zip(trajs_aug, cv_aug, ct_w_g)]
         all_X.append(np.array([o[0] for o in aug_out]))
         all_R.append(np.array([o[1] for o in aug_out]))
-        all_blend.append(blend_rot)
-        all_true.append(true_rot)
-        all_scale.append(disp_scale_g)
+        all_blend.append(blend_aug)
+        all_true.append(true_aug)
+        all_scale.append(disp_aug)
 
     X_all          = np.concatenate(all_X,     axis=0)
     R_all          = np.concatenate(all_R,     axis=0)
@@ -725,7 +738,7 @@ def train_group(log, label,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v20 (v19 + 다중 CT 앵커 + 각가속도)")
+    log.info("모기 비행 궤적 예측 v21 (v19 + 속력 스케일 증강)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -785,7 +798,7 @@ def main():
         X_test, R_test, disp_scale_test,
         feat_names, N_AUG=4,
     )
-    log.info(f"\n[v20-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v21-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
     # ── 메타 게이팅: XGBoost 보정이 도움되는 샘플만 선별 ──────────────────────
@@ -833,8 +846,8 @@ def main():
         'feature':         feat_names,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v20.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v20.csv")
+        out_dir / "feature_importance_v21.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v21.csv")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -842,7 +855,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v20.csv"
+    out_sub = out_dir / "submission_xgb_v21.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
