@@ -30,7 +30,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v17_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v18_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -532,7 +532,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v17.csv"
+    save_path = out_dir / "oof_analysis_v18.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -605,11 +605,76 @@ def mean_dist_cm(preds: np.ndarray, trues: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(preds - trues, axis=1)) * 100)
 
 
+# ── Group training ────────────────────────────────────────────────────────────
+def train_group(log, label,
+                train_data_g, X_g, R_g,
+                blend_g, true_xyz_g, cv_preds_g, ct_w_g, disp_scale_g,
+                X_test, R_test, disp_scale_test,
+                feat_names, N_AUG=4, n_folds=5):
+    """속력 그룹별 독립 증강 + 5-Fold 학습."""
+    n = len(train_data_g)
+    rng = np.random.RandomState(123)
+
+    all_X     = [X_g];         all_R     = [R_g]
+    all_blend = [blend_g];     all_true  = [true_xyz_g]
+    all_scale = [disp_scale_g]
+
+    for _ in range(N_AUG):
+        Q_batch   = np.array([_random_rotation(rng) for _ in range(n)])
+        trajs_rot = [(Q_batch[i] @ train_data_g[i].T).T for i in range(n)]
+        true_rot  = np.einsum('nij,nj->ni', Q_batch, true_xyz_g)
+        blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_g)
+        cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_preds_g)
+        aug_out   = [make_xgb_features(t, cv, cw)
+                     for t, cv, cw in zip(trajs_rot, cv_rot, ct_w_g)]
+        all_X.append(np.array([o[0] for o in aug_out]))
+        all_R.append(np.array([o[1] for o in aug_out]))
+        all_blend.append(blend_rot)
+        all_true.append(true_rot)
+        all_scale.append(disp_scale_g)
+
+    X_all          = np.concatenate(all_X,     axis=0)
+    R_all          = np.concatenate(all_R,     axis=0)
+    blend_all_aug  = np.concatenate(all_blend, axis=0)
+    true_all       = np.concatenate(all_true,  axis=0)
+    disp_scale_all = np.concatenate(all_scale, axis=0)
+    res_loc_norm   = (np.einsum('nij,nj->ni', R_all, true_all - blend_all_aug)
+                      / disp_scale_all[:, None])
+
+    kf           = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    oof          = np.zeros_like(true_xyz_g)
+    test_res_acc = np.zeros((len(disp_scale_test), 3))
+    imp_acc      = np.zeros(len(feat_names))
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(range(n)), 1):
+        tr_aug_idx = np.concatenate([tr_idx + n * r for r in range(N_AUG + 1)])
+        model = MultiOutputRegressor(xgb.XGBRegressor(
+            n_estimators=500, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.7, min_child_weight=3,
+            tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
+        ), n_jobs=1)
+        model.fit(X_all[tr_aug_idx], res_loc_norm[tr_aug_idx])
+
+        val_res_local  = model.predict(X_all[val_idx]) * disp_scale_g[val_idx, None]
+        val_res_global = np.einsum('nji,nj->ni', R_all[val_idx], val_res_local)
+        oof[val_idx]   = blend_all_aug[val_idx] + val_res_global
+        log.info(f"  [{label}] Fold {fold}/{n_folds}  "
+                 f"R-Hit={r_hit(oof[val_idx], true_xyz_g[val_idx]):.4f}  "
+                 f"(n_tr={len(tr_aug_idx):,})")
+
+        test_res_local  = model.predict(X_test) * disp_scale_test[:, None]
+        test_res_acc   += np.einsum('nji,nj->ni', R_test, test_res_local)
+        imp_acc        += np.array([e.feature_importances_
+                                    for e in model.estimators_]).mean(0)
+
+    return oof, test_res_acc / n_folds, imp_acc / n_folds
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v17 (v15 + 속력 기반 잔차 정규화)")
+    log.info("모기 비행 궤적 예측 v18 (속력 구간별 독립 모델 + 속력 정규화)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -659,92 +724,55 @@ def main():
     assert X_train.shape[1] == len(feat_names), \
         f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
 
-    residuals_local = np.einsum('nij,nj->ni', R_train, residuals_train)
-    # 속력 정규화: 잔차를 예상 이동거리로 나눔 (무차원 비율)
-    residuals_local_norm = residuals_local / disp_scale_train[:, None]
+    # ── 속력 기반 그룹 분할 ───────────────────────────────────────────────────
+    speed_thr  = np.percentile(speed_train, 60)   # Q3/Q4 경계 (60th percentile)
+    slow_mask  = speed_train <= speed_thr
+    fast_mask  = ~slow_mask
+    slow_idx   = np.where(slow_mask)[0]            # ~6,000개 (Q1~Q3)
+    fast_idx   = np.where(fast_mask)[0]            # ~4,000개 (Q4~Q5)
+    log.info(f"속력 분할 (임계값={speed_thr:.3f}cm/s): "
+             f"느린={slow_mask.sum()}개 / 빠른={fast_mask.sum()}개")
 
-    # ── 3D 회전 증강 ──────────────────────────────────────────────────────────
-    N_AUG   = 4
-    n_orig  = len(train_data)
-    rng_aug = np.random.RandomState(123)
-    log.info(f"3D 회전 증강 중... (N_AUG={N_AUG}, 총 {n_orig*(N_AUG+1):,}개)")
+    speed_test_mask_slow = speed_test <= speed_thr
+    speed_test_mask_fast = ~speed_test_mask_slow
+    log.info(f"테스트 분할: 느린={speed_test_mask_slow.sum()}개 / 빠른={speed_test_mask_fast.sum()}개")
 
-    all_X     = [X_train]
-    all_R     = [R_train]
-    all_blend = [blend_train]
-    all_true  = [true_xyz]
-    all_scale = [disp_scale_train]   # 회전 불변 → 증강마다 원본 스케일 재사용
+    def _subset(arr, idx):
+        return arr[idx] if isinstance(arr, np.ndarray) else [arr[i] for i in idx]
 
-    for _ in range(N_AUG):
-        Q_batch  = np.array([_random_rotation(rng_aug) for _ in range(n_orig)])
-        trajs_rot = [(Q_batch[i] @ train_data[i].T).T for i in range(n_orig)]
-        true_rot  = np.einsum('nij,nj->ni', Q_batch, true_xyz)
-        blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_train)
-        cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_preds_train)
+    # ── 느린 그룹 모델 (N_AUG=4) ──────────────────────────────────────────────
+    log.info("\n[Slow 그룹] 5-Fold 학습 시작 (N_AUG=4)...")
+    slow_oof, slow_test_res, slow_imp = train_group(
+        log, "Slow",
+        _subset(train_data, slow_idx), X_train[slow_idx], R_train[slow_idx],
+        blend_train[slow_idx], true_xyz[slow_idx],
+        cv_preds_train[slow_idx], ct_w_train[slow_idx], disp_scale_train[slow_idx],
+        X_test, R_test, disp_scale_test,
+        feat_names, N_AUG=4,
+    )
+    log.info(f"[Slow-OOF]  R-Hit={r_hit(slow_oof, true_xyz[slow_idx]):.4f}  "
+             f"MeanDist={mean_dist_cm(slow_oof, true_xyz[slow_idx]):.2f}cm")
 
-        aug_out = [make_xgb_features(t, cv, cw)
-                   for t, cv, cw in zip(trajs_rot, cv_rot, ct_w_train)]
-        all_X.append(np.array([o[0] for o in aug_out]))
-        all_R.append(np.array([o[1] for o in aug_out]))
-        all_blend.append(blend_rot)
-        all_true.append(true_rot)
-        all_scale.append(disp_scale_train)   # 속력 크기는 회전에 불변
+    # ── 빠른 그룹 모델 (N_AUG=6, 샘플 수 보완) ────────────────────────────────
+    log.info("\n[Fast 그룹] 5-Fold 학습 시작 (N_AUG=6)...")
+    fast_oof, fast_test_res, fast_imp = train_group(
+        log, "Fast",
+        _subset(train_data, fast_idx), X_train[fast_idx], R_train[fast_idx],
+        blend_train[fast_idx], true_xyz[fast_idx],
+        cv_preds_train[fast_idx], ct_w_train[fast_idx], disp_scale_train[fast_idx],
+        X_test, R_test, disp_scale_test,
+        feat_names, N_AUG=6,
+    )
+    log.info(f"[Fast-OOF]  R-Hit={r_hit(fast_oof, true_xyz[fast_idx]):.4f}  "
+             f"MeanDist={mean_dist_cm(fast_oof, true_xyz[fast_idx]):.2f}cm")
 
-    X_all         = np.concatenate(all_X,     axis=0)   # (n_orig*(N_AUG+1), F)
-    R_all         = np.concatenate(all_R,     axis=0)
-    blend_all     = np.concatenate(all_blend, axis=0)
-    true_all      = np.concatenate(all_true,  axis=0)
-    disp_scale_all = np.concatenate(all_scale, axis=0)  # (n_orig*(N_AUG+1),)
-    res_all       = true_all - blend_all
-    res_loc_all   = np.einsum('nij,nj->ni', R_all, res_all)
-    res_loc_all_norm = res_loc_all / disp_scale_all[:, None]  # 정규화
-    log.info(f"증강 완료: X_all {X_all.shape}")
+    # ── OOF 조합 ──────────────────────────────────────────────────────────────
+    oof_preds = np.zeros_like(true_xyz)
+    oof_preds[slow_idx] = slow_oof
+    oof_preds[fast_idx] = fast_oof
+    imp_acc = (slow_imp * slow_mask.sum() + fast_imp * fast_mask.sum()) / len(train_data)
 
-    # ── 5-Fold (val=원본만, train=원본+증강) ──────────────────────────────────
-    N_FOLDS     = 5
-    kf          = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    oof_preds   = np.zeros_like(true_xyz)
-    test_res_acc = np.zeros((len(test_data), 3))
-    imp_acc     = np.zeros(len(feat_names))
-
-    log.info("5-Fold XGBoost 학습 시작...")
-    for fold, (tr_orig_idx, val_orig_idx) in enumerate(kf.split(range(n_orig)), 1):
-        # val: 원본 샘플만 (데이터 누수 방지)
-        X_val       = X_all[val_orig_idx]
-        R_val       = R_all[val_orig_idx]
-        val_blend_f = blend_all[val_orig_idx]
-        val_true_f  = true_xyz[val_orig_idx]
-
-        # train: 원본 train + 모든 증강 라운드의 같은 샘플들
-        tr_aug_idx = np.concatenate([
-            tr_orig_idx + n_orig * r for r in range(N_AUG + 1)
-        ])
-        X_tr = X_all[tr_aug_idx]
-        y_tr = res_loc_all_norm[tr_aug_idx]   # 정규화된 타깃 학습
-
-        model = MultiOutputRegressor(xgb.XGBRegressor(
-            n_estimators=500, max_depth=6, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.7, min_child_weight=3,
-            tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
-        ), n_jobs=1)
-        model.fit(X_tr, y_tr)
-
-        # val: 정규화 예측 → 역정규화 (× val 샘플의 속력 스케일)
-        val_scale       = disp_scale_train[val_orig_idx][:, None]
-        val_res_local   = model.predict(X_val) * val_scale
-        val_res_global  = np.einsum('nji,nj->ni', R_val, val_res_local)
-        oof_preds[val_orig_idx] = val_blend_f + val_res_global
-        fold_hit = r_hit(oof_preds[val_orig_idx], val_true_f)
-        log.info(f"  Fold {fold}/{N_FOLDS}  R-Hit={fold_hit:.4f}  "
-                 f"(train {len(X_tr):,}개)")
-
-        # test: 역정규화 (× test 샘플의 속력 스케일)
-        test_res_local  = model.predict(X_test) * disp_scale_test[:, None]
-        test_res_acc   += np.einsum('nji,nj->ni', R_test, test_res_local)
-        imp_acc        += np.array([e.feature_importances_
-                                    for e in model.estimators_]).mean(0)
-
-    log.info(f"\n[v17-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v18-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
     out_dir = Path("output")
@@ -753,9 +781,12 @@ def main():
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
-    final_test = blend_test + test_res_acc / N_FOLDS
+    # ── 테스트 예측: 속력 구간별 모델 라우팅 ─────────────────────────────────
+    final_test = np.zeros((len(test_data), 3))
+    final_test[speed_test_mask_slow] = (blend_test + slow_test_res)[speed_test_mask_slow]
+    final_test[speed_test_mask_fast] = (blend_test + fast_test_res)[speed_test_mask_fast]
 
-    importances = imp_acc / N_FOLDS
+    importances = imp_acc   # 이미 slow/fast 가중 평균
     top_idx = np.argsort(importances)[::-1][:50]
     log.info(f"\n{'='*66}")
     log.info("Top 50 피처 중요도 (5-fold 평균)")
@@ -768,8 +799,8 @@ def main():
         'feature':         feat_names,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v17.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v17.csv")
+        out_dir / "feature_importance_v18.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v18.csv")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -777,7 +808,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v17.csv"
+    out_sub = out_dir / "submission_xgb_v18.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
