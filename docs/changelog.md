@@ -1,5 +1,31 @@
 # Changelog
 
+## v20 (2026-05-25)
+
+### 모델
+- v19 구조 유지 + 다중 CT 앵커 + 각가속도 피처 추가
+
+### 변경 사항
+- `_ct_local_from_omega(vel_local, a_n_vec_local, omega)` 헬퍼 추가
+- 피처 20개 추가 (377 → 397개)
+  - `ct_prev3`: 3스텝 전 ω 기준 CT 예측 (3)
+  - `ct_extrap`: 외삽 ω 기준 CT 예측 (3)
+  - `ct_prev3_vs_cv`, `ct_extrap_vs_cv`: CT vs CV 차이 (6)
+  - `ct_prev3_vs_now`, `ct_extrap_vs_now`: CT 변화량 (6)
+  - `domega_dt`: 각가속도 dω/dt (1)
+  - `omega_extrap`: 외삽 후 ω 값 (1)
+
+### 결과
+- Dacon Public: 0.6542 (v19 대비 -0.0010 ↓)
+
+### 실패 분석
+- dω/dt를 3스텝(120ms) 차분으로 추정 → 모기 불규칙 운동에서 노이즈가 신호를 압도
+- ct_prev3의 방향 벡터를 현재 a_n으로 근사 → 실제 과거 선회 방향과 불일치
+- omega 시계열이 기존 피처에 이미 충분히 담겨 있어 중복 정보
+- 강선회 문제는 CT 개선만으로 해결하기 어려움 — 10개 관측점으로 ω 변화 추정에 근본적 한계
+
+---
+
 ## v19 (2026-05-25)
 
 ### 모델

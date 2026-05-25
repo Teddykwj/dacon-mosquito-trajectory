@@ -30,7 +30,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v19_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v20_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -105,6 +105,22 @@ def predict_ct(traj: np.ndarray) -> tuple[np.ndarray, float]:
     # 신뢰도: 회전각이 클수록 CT가 CV보다 유리 (45도에서 포화)
     ct_weight = float(np.clip(theta / (np.pi / 4), 0.0, 1.0))
     return ct_pred, ct_weight
+
+
+def _ct_local_from_omega(vel_local: np.ndarray, a_n_vec_local: np.ndarray,
+                         omega: float) -> np.ndarray:
+    """주어진 ω(스칼라)로 CT 예측 변위(로컬 좌표)를 계산."""
+    eps   = 1e-8
+    dt    = DT * HORIZON
+    speed = float(np.linalg.norm(vel_local))
+    v_unit = vel_local / (speed + eps)
+    a_n_mag = float(np.linalg.norm(a_n_vec_local))
+    n_hat  = a_n_vec_local / (a_n_mag + eps)
+    theta  = omega * dt
+    if omega < 1e-6 or speed < 1e-6 or a_n_mag < 1e-6:
+        return vel_local * dt          # 퇴화 → CV
+    R_curve = speed / (omega + eps)
+    return R_curve * np.sin(theta) * v_unit + R_curve * (1 - np.cos(theta)) * n_hat
 
 
 def batch_physics_blend(data: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -284,6 +300,23 @@ def make_xgb_features(traj: np.ndarray,
     ct_pred_L          = (ct_pred_global - traj[-1]) @ R.T   # 로컬 변위
     ct_vs_cv_L         = ct_pred_L - cv_L                    # CT - CV 차이
 
+    # ── [NEW v20] 다중 CT 앵커 + 각가속도 ────────────────────────────────────
+    # 마지막 프레임의 법선 가속도 벡터 (로컬)
+    v_unit_last  = vels[-1] / (speed[-1] + 1e-8)
+    at_last_val  = float(np.dot(accs[-1], v_unit_last))
+    a_n_vec_last = accs[-1] - at_last_val * v_unit_last       # (3,) 로컬
+
+    omega_now    = float(omega[-1])
+    omega_prev3  = float(omega[-4])                           # 3스텝 전 ω
+    omega_mean3  = float(omega[-3:].mean())                   # 최근 3스텝 평균 ω
+    # 각가속도 dω/dt (3스텝 차분)
+    domega_dt    = float((omega[-1] - omega[-4]) / (3 * DT))
+    omega_extrap = float(max(0.0, omega_now + domega_dt * DT * HORIZON))
+
+    ct_L_prev3  = _ct_local_from_omega(vels[-1], a_n_vec_last, omega_prev3)
+    ct_L_extrap = _ct_local_from_omega(vels[-1], a_n_vec_last, omega_extrap)
+    ct_L_mean3  = _ct_local_from_omega(vels[-1], a_n_vec_last, omega_mean3)
+
     feats = np.concatenate([
         # ── 기존 시계열 ──────────────────────────────────────────────────────
         vels.flatten(),           # (30)
@@ -367,6 +400,15 @@ def make_xgb_features(traj: np.ndarray,
         ct_pred_L,              # (3) CT 예측 로컬 변위
         ct_vs_cv_L,             # (3) CT - CV 차이 (선회 보정량)
         [ct_weight],            # (1) 선회 강도 기반 CT 신뢰도
+
+        # ── [NEW v20] 다중 CT 앵커 + 각가속도 ──────────────────────────────
+        ct_L_prev3,                      # (3) 3스텝 전 ω 기준 CT
+        ct_L_prev3 - cv_L,               # (3) prev-CT vs CV
+        ct_L_extrap,                     # (3) 외삽 ω 기준 CT
+        ct_L_extrap - cv_L,              # (3) extrap-CT vs CV
+        ct_L_prev3 - ct_pred_L,          # (3) prev-CT vs now-CT (선회율 변화)
+        ct_L_extrap - ct_pred_L,         # (3) extrap-CT vs now-CT
+        [domega_dt, omega_extrap],       # (2) 각가속도, 외삽 ω
     ])
     return feats.astype(np.float32), R
 
@@ -469,6 +511,15 @@ def make_feature_names() -> list[str]:
     for ax in axes: N.append(f"ct_pred_{ax}")
     for ax in axes: N.append(f"ct_vs_cv_{ax}")
     N += ["ct_weight"]
+
+    # [NEW v20] 다중 CT 앵커 + 각가속도
+    for ax in axes: N.append(f"ct_prev3_{ax}")
+    for ax in axes: N.append(f"ct_prev3_vs_cv_{ax}")
+    for ax in axes: N.append(f"ct_extrap_{ax}")
+    for ax in axes: N.append(f"ct_extrap_vs_cv_{ax}")
+    for ax in axes: N.append(f"ct_prev3_vs_now_{ax}")
+    for ax in axes: N.append(f"ct_extrap_vs_now_{ax}")
+    N += ["domega_dt", "omega_extrap"]
     return N
 
 
@@ -532,7 +583,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v19.csv"
+    save_path = out_dir / "oof_analysis_v20.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -674,7 +725,7 @@ def train_group(log, label,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v19 (v17 + 메타 게이팅)")
+    log.info("모기 비행 궤적 예측 v20 (v19 + 다중 CT 앵커 + 각가속도)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -734,7 +785,7 @@ def main():
         X_test, R_test, disp_scale_test,
         feat_names, N_AUG=4,
     )
-    log.info(f"\n[v19-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v20-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
     # ── 메타 게이팅: XGBoost 보정이 도움되는 샘플만 선별 ──────────────────────
@@ -782,8 +833,8 @@ def main():
         'feature':         feat_names,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v19.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v19.csv")
+        out_dir / "feature_importance_v20.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v20.csv")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -791,7 +842,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v19.csv"
+    out_sub = out_dir / "submission_xgb_v20.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
