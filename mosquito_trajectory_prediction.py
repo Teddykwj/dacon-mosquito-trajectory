@@ -30,7 +30,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v21_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v22_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -583,7 +583,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v21.csv"
+    save_path = out_dir / "oof_analysis_v22.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -661,8 +661,10 @@ def train_group(log, label,
                 train_data_g, X_g, R_g,
                 blend_g, true_xyz_g, cv_preds_g, ct_w_g, disp_scale_g,
                 X_test, R_test, disp_scale_test,
-                feat_names, N_AUG=4, n_folds=5):
-    """속력 그룹별 독립 증강 + 5-Fold 학습."""
+                feat_names, N_AUG=4, n_folds=5,
+                test_data=None, blend_test_raw=None,
+                cv_test_raw=None, ct_w_test_raw=None, N_TTA=0):
+    """증강 + 5-Fold 학습. N_TTA>0이면 테스트에 TTA 적용."""
     n = len(train_data_g)
     rng = np.random.RandomState(123)
 
@@ -709,6 +711,7 @@ def train_group(log, label,
     oof          = np.zeros_like(true_xyz_g)
     test_res_acc = np.zeros((len(disp_scale_test), 3))
     imp_acc      = np.zeros(len(feat_names))
+    fold_models  = []
 
     for fold, (tr_idx, val_idx) in enumerate(kf.split(range(n)), 1):
         tr_aug_idx = np.concatenate([tr_idx + n * r for r in range(N_AUG + 1)])
@@ -718,6 +721,7 @@ def train_group(log, label,
             tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
         ), n_jobs=1)
         model.fit(X_all[tr_aug_idx], res_loc_norm[tr_aug_idx])
+        fold_models.append(model)
 
         val_res_local  = model.predict(X_all[val_idx]) * disp_scale_g[val_idx, None]
         val_res_global = np.einsum('nji,nj->ni', R_all[val_idx], val_res_local)
@@ -731,14 +735,59 @@ def train_group(log, label,
         imp_acc        += np.array([e.feature_importances_
                                     for e in model.estimators_]).mean(0)
 
-    return oof, test_res_acc / n_folds, imp_acc / n_folds
+    n_folds_actual  = len(fold_models)
+    test_res_orig   = test_res_acc / n_folds_actual
+
+    # ── TTA (Test Time Augmentation) ──────────────────────────────────────────
+    if N_TTA > 0 and test_data is not None:
+        rng_tta = np.random.RandomState(999)
+        n_test  = len(test_data)
+        tta_acc = np.zeros((n_test, 3))
+
+        for _ in range(N_TTA):
+            Q_batch   = np.array([_random_rotation(rng_tta) for _ in range(n_test)])
+            s_batch   = rng_tta.uniform(0.5, 2.0, size=n_test)
+
+            trajs_rot = [(Q_batch[i] @ test_data[i].T).T for i in range(n_test)]
+            last_rot  = np.array([t[-1] for t in trajs_rot])
+            blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_test_raw)
+            cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_test_raw)
+
+            s = s_batch[:, None]
+            trajs_aug = [last_rot[i] + (trajs_rot[i] - last_rot[i]) * s_batch[i]
+                         for i in range(n_test)]
+            blend_aug = last_rot + (blend_rot - last_rot) * s
+            cv_aug    = last_rot + (cv_rot    - last_rot) * s
+            disp_aug  = disp_scale_test * s_batch
+
+            aug_out = [make_xgb_features(t, cv, cw)
+                       for t, cv, cw in zip(trajs_aug, cv_aug, ct_w_test_raw)]
+            X_aug = np.array([o[0] for o in aug_out])
+            R_aug = np.array([o[1] for o in aug_out])
+
+            # 5개 폴드 모델 평균 예측
+            norm_res = np.zeros((n_test, 3))
+            for m in fold_models:
+                norm_res += m.predict(X_aug)
+            norm_res /= n_folds_actual
+
+            # 로컬 → 증강 글로벌 → 원본 프레임으로 역변환
+            delta_aug  = np.einsum('nji,nj->ni', R_aug,   norm_res * disp_aug[:, None])
+            delta_orig = np.einsum('nji,nj->ni', Q_batch, delta_aug) / s  # Q.T @ delta / s
+            tta_acc   += delta_orig
+
+        test_res_final = (test_res_orig + tta_acc / N_TTA) / 2
+    else:
+        test_res_final = test_res_orig
+
+    return oof, test_res_final, imp_acc / n_folds_actual
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v21 (v19 + 속력 스케일 증강)")
+    log.info("모기 비행 궤적 예측 v22 (v21 + TTA N=8)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -788,8 +837,8 @@ def main():
     assert X_train.shape[1] == len(feat_names), \
         f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
 
-    # ── 단일 모델 5-Fold 학습 (v17 구조 복귀) ────────────────────────────────
-    log.info("5-Fold XGBoost 학습 시작 (N_AUG=4)...")
+    # ── 단일 모델 5-Fold 학습 + TTA ──────────────────────────────────────────
+    log.info("5-Fold XGBoost 학습 시작 (N_AUG=4, N_TTA=8)...")
     oof_preds, xgb_test_res, imp_acc = train_group(
         log, "All",
         train_data, X_train, R_train,
@@ -797,8 +846,13 @@ def main():
         cv_preds_train, ct_w_train, disp_scale_train,
         X_test, R_test, disp_scale_test,
         feat_names, N_AUG=4,
+        test_data=test_data,
+        blend_test_raw=blend_test,
+        cv_test_raw=cv_preds_test,
+        ct_w_test_raw=ct_w_test,
+        N_TTA=8,
     )
-    log.info(f"\n[v21-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v22-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
     # ── 메타 게이팅: XGBoost 보정이 도움되는 샘플만 선별 ──────────────────────
@@ -846,8 +900,8 @@ def main():
         'feature':         feat_names,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v21.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v21.csv")
+        out_dir / "feature_importance_v22.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v22.csv")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -855,7 +909,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v21.csv"
+    out_sub = out_dir / "submission_xgb_v22.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
