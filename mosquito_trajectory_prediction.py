@@ -30,7 +30,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v18_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v19_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -532,7 +532,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v18.csv"
+    save_path = out_dir / "oof_analysis_v19.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -674,7 +674,7 @@ def train_group(log, label,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v18 (속력 구간별 독립 모델 + 속력 정규화)")
+    log.info("모기 비행 궤적 예측 v19 (v17 + 메타 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -724,56 +724,41 @@ def main():
     assert X_train.shape[1] == len(feat_names), \
         f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
 
-    # ── 속력 기반 그룹 분할 ───────────────────────────────────────────────────
-    speed_thr  = np.percentile(speed_train, 60)   # Q3/Q4 경계 (60th percentile)
-    slow_mask  = speed_train <= speed_thr
-    fast_mask  = ~slow_mask
-    slow_idx   = np.where(slow_mask)[0]            # ~6,000개 (Q1~Q3)
-    fast_idx   = np.where(fast_mask)[0]            # ~4,000개 (Q4~Q5)
-    log.info(f"속력 분할 (임계값={speed_thr:.3f}cm/s): "
-             f"느린={slow_mask.sum()}개 / 빠른={fast_mask.sum()}개")
-
-    speed_test_mask_slow = speed_test <= speed_thr
-    speed_test_mask_fast = ~speed_test_mask_slow
-    log.info(f"테스트 분할: 느린={speed_test_mask_slow.sum()}개 / 빠른={speed_test_mask_fast.sum()}개")
-
-    def _subset(arr, idx):
-        return arr[idx] if isinstance(arr, np.ndarray) else [arr[i] for i in idx]
-
-    # ── 느린 그룹 모델 (N_AUG=4) ──────────────────────────────────────────────
-    log.info("\n[Slow 그룹] 5-Fold 학습 시작 (N_AUG=4)...")
-    slow_oof, slow_test_res, slow_imp = train_group(
-        log, "Slow",
-        _subset(train_data, slow_idx), X_train[slow_idx], R_train[slow_idx],
-        blend_train[slow_idx], true_xyz[slow_idx],
-        cv_preds_train[slow_idx], ct_w_train[slow_idx], disp_scale_train[slow_idx],
+    # ── 단일 모델 5-Fold 학습 (v17 구조 복귀) ────────────────────────────────
+    log.info("5-Fold XGBoost 학습 시작 (N_AUG=4)...")
+    oof_preds, xgb_test_res, imp_acc = train_group(
+        log, "All",
+        train_data, X_train, R_train,
+        blend_train, true_xyz,
+        cv_preds_train, ct_w_train, disp_scale_train,
         X_test, R_test, disp_scale_test,
         feat_names, N_AUG=4,
     )
-    log.info(f"[Slow-OOF]  R-Hit={r_hit(slow_oof, true_xyz[slow_idx]):.4f}  "
-             f"MeanDist={mean_dist_cm(slow_oof, true_xyz[slow_idx]):.2f}cm")
-
-    # ── 빠른 그룹 모델 (N_AUG=6, 샘플 수 보완) ────────────────────────────────
-    log.info("\n[Fast 그룹] 5-Fold 학습 시작 (N_AUG=6)...")
-    fast_oof, fast_test_res, fast_imp = train_group(
-        log, "Fast",
-        _subset(train_data, fast_idx), X_train[fast_idx], R_train[fast_idx],
-        blend_train[fast_idx], true_xyz[fast_idx],
-        cv_preds_train[fast_idx], ct_w_train[fast_idx], disp_scale_train[fast_idx],
-        X_test, R_test, disp_scale_test,
-        feat_names, N_AUG=6,
-    )
-    log.info(f"[Fast-OOF]  R-Hit={r_hit(fast_oof, true_xyz[fast_idx]):.4f}  "
-             f"MeanDist={mean_dist_cm(fast_oof, true_xyz[fast_idx]):.2f}cm")
-
-    # ── OOF 조합 ──────────────────────────────────────────────────────────────
-    oof_preds = np.zeros_like(true_xyz)
-    oof_preds[slow_idx] = slow_oof
-    oof_preds[fast_idx] = fast_oof
-    imp_acc = (slow_imp * slow_mask.sum() + fast_imp * fast_mask.sum()) / len(train_data)
-
-    log.info(f"\n[v18-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v19-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
+
+    # ── 메타 게이팅: XGBoost 보정이 도움되는 샘플만 선별 ──────────────────────
+    oof_err   = np.linalg.norm(oof_preds - true_xyz, axis=1)
+    blend_err = np.linalg.norm(blend_train - true_xyz, axis=1)
+    gate_labels = (oof_err < blend_err).astype(int)   # 1=개선, 0=악화
+    log.info(f"\n[Gate] 개선={gate_labels.sum()}개  악화={(~gate_labels.astype(bool)).sum()}개  "
+             f"개선율={gate_labels.mean()*100:.1f}%")
+
+    gate_clf = xgb.XGBClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.7,
+        tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
+    )
+    gate_clf.fit(X_train, gate_labels)
+
+    gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]    # (N_test,)
+    gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]   # (N_train, in-sample)
+
+    # in-sample 게이팅 효과 (낙관적이지만 방향성 확인용)
+    xgb_train_res = oof_preds - blend_train
+    oof_gated     = blend_train + gate_prob_train[:, None] * xgb_train_res
+    log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
+             f"(raw OOF={r_hit(oof_preds, true_xyz):.4f})")
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
@@ -781,12 +766,10 @@ def main():
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
-    # ── 테스트 예측: 속력 구간별 모델 라우팅 ─────────────────────────────────
-    final_test = np.zeros((len(test_data), 3))
-    final_test[speed_test_mask_slow] = (blend_test + slow_test_res)[speed_test_mask_slow]
-    final_test[speed_test_mask_fast] = (blend_test + fast_test_res)[speed_test_mask_fast]
+    # ── 테스트 최종 예측: soft gating 적용 ───────────────────────────────────
+    final_test = blend_test + gate_prob_test[:, None] * xgb_test_res
 
-    importances = imp_acc   # 이미 slow/fast 가중 평균
+    importances = imp_acc
     top_idx = np.argsort(importances)[::-1][:50]
     log.info(f"\n{'='*66}")
     log.info("Top 50 피처 중요도 (5-fold 평균)")
@@ -799,8 +782,8 @@ def main():
         'feature':         feat_names,
         'importance_mean': importances,
     }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v18.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v18.csv")
+        out_dir / "feature_importance_v19.csv", index=False)
+    log.info(f"\n피처 중요도 저장 → output/feature_importance_v19.csv")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -808,7 +791,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v18.csv"
+    out_sub = out_dir / "submission_xgb_v19.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)

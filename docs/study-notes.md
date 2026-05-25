@@ -232,6 +232,96 @@ train = 원본(val 제외) + 증강 4벌(val 원본의 증강본도 제외)
 
 ---
 
+## 13. 물리 블렌드 앵커 (CV + CT 혼합)
+
+XGBoost의 기준점. 두 물리 모델을 선회 강도에 따라 가중 합산한다.
+
+### CV-last (등속 모델)
+```python
+vel  = (traj[-1] - traj[-2]) / DT      # 마지막 순간 속도
+pred = traj[-1] + vel * DT * HORIZON   # 80ms 후 위치 (직선 연장)
+```
+"지금 속도로 직진하면" 이라는 단순 가정.
+
+### CT (Constant Turn Rate, 등속 선회율 모델)
+```python
+ω     = a_n / speed        # 법선가속도 ÷ 속력 = 각속도 (rad/s)
+theta = ω × 0.08s          # 예측 구간 동안 회전각
+# 원호 경로로 위치 계산 (곡선)
+ct_weight = clip(theta / (π/4), 0, 1)  # 45도에서 포화
+```
+"지금 선회율을 유지하면" 이라는 가정. 강한 선회일수록 신뢰.
+
+### 블렌드
+```
+blend = (1 - ct_weight) × cv_pred + ct_weight × ct_pred
+```
+
+| ct_weight | 상황 | blend |
+|-----------|------|-------|
+| ≈ 0 | 직진 중 | CV-last 그대로 |
+| 0.3~0.5 | 약한 선회 | CV + CT 혼합 |
+| 1.0 | 강한 선회 | CT 전적 신뢰 |
+
+CT 블렌드 앵커 자체 R-Hit은 0.5385 (CV 0.5788보다 낮음). 하지만 ct_pred, ct_vs_cv를 피처로 제공하면 XGBoost가 선회 방향 정보를 활용해 예측을 크게 개선함.
+
+XGBoost는 `true_xyz - blend` 잔차를 학습하고, 최종 예측은 `blend + xgb_residual`.
+
+---
+
+## 14. 메타 게이팅 (v19)
+
+### 핵심 문제
+
+XGBoost 보정이 모든 샘플에서 도움이 되지 않음.
+- 개선 샘플: 6,241개 (62.4%)
+- 악화 샘플: 3,759개 (37.6%) → 보정이 오히려 노이즈
+
+### 라벨 생성
+
+OOF 기반이라 누수 없음 (oof_preds는 학습에 참여하지 않은 fold에서 예측된 값).
+
+```python
+oof_err   = np.linalg.norm(oof_preds - true_xyz, axis=1)   # XGBoost 최종 오차
+blend_err = np.linalg.norm(blend_train - true_xyz, axis=1)  # 물리 앵커 오차
+
+gate_labels = (oof_err < blend_err).astype(int)  # 1=개선, 0=악화
+```
+
+샘플마다 "XGBoost 보정 후 오차 < 보정 전 오차"이면 1, 아니면 0.
+
+### 게이트 분류기 학습
+
+```python
+gate_clf = XGBClassifier(depth=4, 300 trees, lr=0.05)
+gate_clf.fit(X_train, gate_labels)
+gate_prob = gate_clf.predict_proba(X_test)[:, 1]  # 0.0 ~ 1.0
+```
+
+피처를 보고 "이 샘플에서 XGBoost가 도움이 될 확률"을 출력.
+
+### Soft gate 적용
+
+```python
+final = blend + gate_prob × xgb_residual
+```
+
+- `gate_prob = 1.0` → XGBoost 보정 100% 적용
+- `gate_prob = 0.0` → 블렌드 앵커만 사용
+- 중간값 → 부분 적용
+
+### 효과
+
+| | v17 | v19 |
+|--|-----|-----|
+| OOF (raw) | 0.6134 | 0.6134 |
+| OOF (gated, in-sample) | - | 0.6360 |
+| Dacon Public | 0.6478 | **0.6552** |
+
+OOF-Gated(0.6360) < Dacon(0.6552) → 테스트에서 더 잘 일반화됨. 게이트가 노이즈성 보정을 차단해 실제 환경에서 효과 극대화.
+
+---
+
 ## 12. main() 흐름 (v15 최신)
 
 ```

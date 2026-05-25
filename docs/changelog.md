@@ -1,5 +1,37 @@
 # Changelog
 
+## v19 (2026-05-25)
+
+### 모델
+- v17 구조(XGBoost + CT 블렌드 + 3D 회전 증강 + 5-Fold + 속력 정규화) 유지
+- **메타 게이팅(Meta Gating)** 추가: XGBClassifier가 "XGBoost 보정이 도움이 되는가" 분류
+
+### 핵심 변경
+- `gate_labels = (oof_err < blend_err)` — OOF 오차 < 블렌드 오차이면 1 (개선), 아니면 0 (악화)
+- XGBClassifier(depth=4, 300 trees, lr=0.05)로 5-Fold OOF 기반 게이트 학습
+- Soft gate 적용: `final = blend + gate_prob × xgb_residual`
+  - gate_prob=1.0 → XGBoost 전적으로 신뢰, gate_prob=0.0 → 블렌드 앵커 유지
+- OOF-gated (in-sample): `oof_gated = blend + gate_prob_train × (oof_preds - blend)`
+- 테스트: gate_prob_test는 train과 동일한 gate_clf로 예측 (누수 없음)
+
+### 결과
+- OOF R-Hit: 0.6134 (raw, v17과 동일)
+- OOF-Gated R-Hit: 0.6360 (+0.0226 over raw, in-sample)
+- Dacon Public: **0.6552** (v17 대비 +0.0074 ↑↑, 역대 최고)
+- 1등(0.7)과의 격차: 0.0448
+
+### 게이트 분석
+- 개선 샘플: 6,241개 (62.4%), 악화 샘플: 3,759개 (37.6%)
+- OOF-Gated(0.6360) < Dacon(0.6552) → 테스트에서 더 잘 일반화
+- 게이트가 XGBoost 보정이 오히려 노이즈인 샘플을 차단해 실제 환경에서 효과 극대화
+
+### 잔존 문제
+- Q5(빠름): R-Hit=0.341 (여전히 하위)
+- 강선회(ct_w 0.6~1.0): R-Hit=0.397
+- CV-last 대비 악화 샘플: 3,575개 (35.8%) — 게이팅 후에도 남음
+
+---
+
 ## v18 (2026-05-25)
 
 ### 모델
