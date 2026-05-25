@@ -1,5 +1,39 @@
 # Changelog
 
+## v23 (2026-05-26)
+
+### 모델
+- v19 구조에서 XGBoost 회귀자 → TrajTransformer로 교체
+- 메타 게이팅은 XGBoost 분류기 유지 (피처 377개)
+
+### 아키텍처
+- vel_embed(3→64) + 학습 가능 위치 인코딩(10, 64)
+- Pre-LN TransformerEncoder (d_model=64, nhead=4, num_layers=2, FFN=256) → last token
+- Head: Linear(64+7, 128) + GELU + Dropout + Linear(128, 3)
+- 파라미터 수: 110,467
+- 입력: 속력 기반 정규화 (vel × DT·HORIZON / disp_scale, ct_pred_L / disp_scale)
+
+### 변경 사항
+- `prepare_dl_inputs()`: 로컬 프레임 속도 시퀀스(10,3) + 물리 피처(7) 생성
+- `TrajTransformer`: 시퀀스 인코더 + 물리 피처 결합 → 정규화 잔차 예측
+- `train_dl_5fold()`: 5-Fold CV + 회전 증강(N_AUG=4) + 50 에폭 Adam+CosineAnnealingLR
+- CT 결과를 한 번만 계산해 XGBoost 피처와 DL 입력에 재사용
+
+### 결과
+- Fold별 R-Hit: 0.6325 / 0.6240 / 0.6255 / 0.6105 / 0.6200 (분산 높음)
+- OOF R-Hit: 0.6225 (+0.009 vs v19 XGBoost 0.6134)
+- Gated OOF: 0.6367 (+0.0007 vs v19 0.6360)
+- Dacon Public: **0.6472** (v19 대비 -0.008 ↓)
+
+### 실패 분석
+- OOF는 개선됐지만 Dacon에서 역전 → Transformer 과적합 또는 일반화 열세
+- Fold 분산 (std ≈ 0.007) vs XGBoost v22 (std ≈ 0.003) — DL이 더 불안정
+- XGBoost의 명시적 물리 피처 377개가 test 분포를 더 잘 커버하는 것으로 추정
+- 강선회(ct_weight 0.6~1.0): R-Hit 0.385 (XGBoost 0.397보다도 낮음)
+- v19가 여전히 Dacon 최고 (0.6552)
+
+---
+
 ## v22 (2026-05-25)
 
 ### 모델

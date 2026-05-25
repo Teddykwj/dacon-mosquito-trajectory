@@ -8,6 +8,9 @@ from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import KFold
 import xgboost as xgb
 import lightgbm as lgb
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 DATA_DIR   = Path("data")
@@ -30,7 +33,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v22_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v23_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -105,22 +108,6 @@ def predict_ct(traj: np.ndarray) -> tuple[np.ndarray, float]:
     # 신뢰도: 회전각이 클수록 CT가 CV보다 유리 (45도에서 포화)
     ct_weight = float(np.clip(theta / (np.pi / 4), 0.0, 1.0))
     return ct_pred, ct_weight
-
-
-def _ct_local_from_omega(vel_local: np.ndarray, a_n_vec_local: np.ndarray,
-                         omega: float) -> np.ndarray:
-    """주어진 ω(스칼라)로 CT 예측 변위(로컬 좌표)를 계산."""
-    eps   = 1e-8
-    dt    = DT * HORIZON
-    speed = float(np.linalg.norm(vel_local))
-    v_unit = vel_local / (speed + eps)
-    a_n_mag = float(np.linalg.norm(a_n_vec_local))
-    n_hat  = a_n_vec_local / (a_n_mag + eps)
-    theta  = omega * dt
-    if omega < 1e-6 or speed < 1e-6 or a_n_mag < 1e-6:
-        return vel_local * dt          # 퇴화 → CV
-    R_curve = speed / (omega + eps)
-    return R_curve * np.sin(theta) * v_unit + R_curve * (1 - np.cos(theta)) * n_hat
 
 
 def batch_physics_blend(data: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -300,23 +287,6 @@ def make_xgb_features(traj: np.ndarray,
     ct_pred_L          = (ct_pred_global - traj[-1]) @ R.T   # 로컬 변위
     ct_vs_cv_L         = ct_pred_L - cv_L                    # CT - CV 차이
 
-    # ── [NEW v20] 다중 CT 앵커 + 각가속도 ────────────────────────────────────
-    # 마지막 프레임의 법선 가속도 벡터 (로컬)
-    v_unit_last  = vels[-1] / (speed[-1] + 1e-8)
-    at_last_val  = float(np.dot(accs[-1], v_unit_last))
-    a_n_vec_last = accs[-1] - at_last_val * v_unit_last       # (3,) 로컬
-
-    omega_now    = float(omega[-1])
-    omega_prev3  = float(omega[-4])                           # 3스텝 전 ω
-    omega_mean3  = float(omega[-3:].mean())                   # 최근 3스텝 평균 ω
-    # 각가속도 dω/dt (3스텝 차분)
-    domega_dt    = float((omega[-1] - omega[-4]) / (3 * DT))
-    omega_extrap = float(max(0.0, omega_now + domega_dt * DT * HORIZON))
-
-    ct_L_prev3  = _ct_local_from_omega(vels[-1], a_n_vec_last, omega_prev3)
-    ct_L_extrap = _ct_local_from_omega(vels[-1], a_n_vec_last, omega_extrap)
-    ct_L_mean3  = _ct_local_from_omega(vels[-1], a_n_vec_last, omega_mean3)
-
     feats = np.concatenate([
         # ── 기존 시계열 ──────────────────────────────────────────────────────
         vels.flatten(),           # (30)
@@ -400,15 +370,6 @@ def make_xgb_features(traj: np.ndarray,
         ct_pred_L,              # (3) CT 예측 로컬 변위
         ct_vs_cv_L,             # (3) CT - CV 차이 (선회 보정량)
         [ct_weight],            # (1) 선회 강도 기반 CT 신뢰도
-
-        # ── [NEW v20] 다중 CT 앵커 + 각가속도 ──────────────────────────────
-        ct_L_prev3,                      # (3) 3스텝 전 ω 기준 CT
-        ct_L_prev3 - cv_L,               # (3) prev-CT vs CV
-        ct_L_extrap,                     # (3) 외삽 ω 기준 CT
-        ct_L_extrap - cv_L,              # (3) extrap-CT vs CV
-        ct_L_prev3 - ct_pred_L,          # (3) prev-CT vs now-CT (선회율 변화)
-        ct_L_extrap - ct_pred_L,         # (3) extrap-CT vs now-CT
-        [domega_dt, omega_extrap],       # (2) 각가속도, 외삽 ω
     ])
     return feats.astype(np.float32), R
 
@@ -511,15 +472,6 @@ def make_feature_names() -> list[str]:
     for ax in axes: N.append(f"ct_pred_{ax}")
     for ax in axes: N.append(f"ct_vs_cv_{ax}")
     N += ["ct_weight"]
-
-    # [NEW v20] 다중 CT 앵커 + 각가속도
-    for ax in axes: N.append(f"ct_prev3_{ax}")
-    for ax in axes: N.append(f"ct_prev3_vs_cv_{ax}")
-    for ax in axes: N.append(f"ct_extrap_{ax}")
-    for ax in axes: N.append(f"ct_extrap_vs_cv_{ax}")
-    for ax in axes: N.append(f"ct_prev3_vs_now_{ax}")
-    for ax in axes: N.append(f"ct_extrap_vs_now_{ax}")
-    N += ["domega_dt", "omega_extrap"]
     return N
 
 
@@ -583,7 +535,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v22.csv"
+    save_path = out_dir / "oof_analysis_v23.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -661,10 +613,8 @@ def train_group(log, label,
                 train_data_g, X_g, R_g,
                 blend_g, true_xyz_g, cv_preds_g, ct_w_g, disp_scale_g,
                 X_test, R_test, disp_scale_test,
-                feat_names, N_AUG=4, n_folds=5,
-                test_data=None, blend_test_raw=None,
-                cv_test_raw=None, ct_w_test_raw=None, N_TTA=0):
-    """증강 + 5-Fold 학습. N_TTA>0이면 테스트에 TTA 적용."""
+                feat_names, N_AUG=4, n_folds=5):
+    """속력 그룹별 독립 증강 + 5-Fold 학습."""
     n = len(train_data_g)
     rng = np.random.RandomState(123)
 
@@ -674,30 +624,17 @@ def train_group(log, label,
 
     for _ in range(N_AUG):
         Q_batch   = np.array([_random_rotation(rng) for _ in range(n)])
-        s_batch   = rng.uniform(0.5, 2.0, size=n)          # [v21] 속력 스케일
-
         trajs_rot = [(Q_batch[i] @ train_data_g[i].T).T for i in range(n)]
-        last_rot  = np.array([t[-1] for t in trajs_rot])   # (n, 3)
         true_rot  = np.einsum('nij,nj->ni', Q_batch, true_xyz_g)
         blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_g)
         cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_preds_g)
-
-        # [v21] 마지막 위치 기준 상대 거리 스케일 (방향 유지, 속력 변경)
-        s = s_batch[:, None]
-        trajs_aug = [last_rot[i] + (trajs_rot[i] - last_rot[i]) * s_batch[i]
-                     for i in range(n)]
-        true_aug  = last_rot + (true_rot  - last_rot) * s
-        blend_aug = last_rot + (blend_rot - last_rot) * s
-        cv_aug    = last_rot + (cv_rot    - last_rot) * s
-        disp_aug  = disp_scale_g * s_batch
-
         aug_out   = [make_xgb_features(t, cv, cw)
-                     for t, cv, cw in zip(trajs_aug, cv_aug, ct_w_g)]
+                     for t, cv, cw in zip(trajs_rot, cv_rot, ct_w_g)]
         all_X.append(np.array([o[0] for o in aug_out]))
         all_R.append(np.array([o[1] for o in aug_out]))
-        all_blend.append(blend_aug)
-        all_true.append(true_aug)
-        all_scale.append(disp_aug)
+        all_blend.append(blend_rot)
+        all_true.append(true_rot)
+        all_scale.append(disp_scale_g)
 
     X_all          = np.concatenate(all_X,     axis=0)
     R_all          = np.concatenate(all_R,     axis=0)
@@ -711,7 +648,6 @@ def train_group(log, label,
     oof          = np.zeros_like(true_xyz_g)
     test_res_acc = np.zeros((len(disp_scale_test), 3))
     imp_acc      = np.zeros(len(feat_names))
-    fold_models  = []
 
     for fold, (tr_idx, val_idx) in enumerate(kf.split(range(n)), 1):
         tr_aug_idx = np.concatenate([tr_idx + n * r for r in range(N_AUG + 1)])
@@ -721,7 +657,6 @@ def train_group(log, label,
             tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
         ), n_jobs=1)
         model.fit(X_all[tr_aug_idx], res_loc_norm[tr_aug_idx])
-        fold_models.append(model)
 
         val_res_local  = model.predict(X_all[val_idx]) * disp_scale_g[val_idx, None]
         val_res_global = np.einsum('nji,nj->ni', R_all[val_idx], val_res_local)
@@ -735,59 +670,176 @@ def train_group(log, label,
         imp_acc        += np.array([e.feature_importances_
                                     for e in model.estimators_]).mean(0)
 
-    n_folds_actual  = len(fold_models)
-    test_res_orig   = test_res_acc / n_folds_actual
+    return oof, test_res_acc / n_folds, imp_acc / n_folds
 
-    # ── TTA (Test Time Augmentation) ──────────────────────────────────────────
-    if N_TTA > 0 and test_data is not None:
-        rng_tta = np.random.RandomState(999)
-        n_test  = len(test_data)
-        tta_acc = np.zeros((n_test, 3))
 
-        for _ in range(N_TTA):
-            Q_batch   = np.array([_random_rotation(rng_tta) for _ in range(n_test)])
-            s_batch   = rng_tta.uniform(0.5, 2.0, size=n_test)
+# ── DL: 입력 준비 ─────────────────────────────────────────────────────────────
+def prepare_dl_inputs(traj: np.ndarray,
+                      ct_pred_global: np.ndarray,
+                      ct_weight: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """로컬 프레임 속도 시퀀스 + 물리 피처.
+    Returns (vel_seq [10,3], phys [7], R [3,3]).
+    """
+    vels_g    = np.diff(traj, axis=0) / DT               # (10, 3) global
+    R         = _local_frame_rotation(vels_g[-1])
+    vel_seq   = (vels_g @ R.T).astype(np.float32)        # (10, 3) local frame
+    cv_L      = vels_g[-1] @ R.T * DT * HORIZON          # (3,) CV local
+    ct_pred_L = ((ct_pred_global - traj[-1]) @ R.T).astype(np.float32)
+    ct_vs_cv_L = (ct_pred_L - cv_L).astype(np.float32)
+    phys = np.concatenate([ct_pred_L, ct_vs_cv_L, [ct_weight]]).astype(np.float32)
+    return vel_seq, phys, R
 
-            trajs_rot = [(Q_batch[i] @ test_data[i].T).T for i in range(n_test)]
-            last_rot  = np.array([t[-1] for t in trajs_rot])
-            blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_test_raw)
-            cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_test_raw)
 
-            s = s_batch[:, None]
-            trajs_aug = [last_rot[i] + (trajs_rot[i] - last_rot[i]) * s_batch[i]
-                         for i in range(n_test)]
-            blend_aug = last_rot + (blend_rot - last_rot) * s
-            cv_aug    = last_rot + (cv_rot    - last_rot) * s
-            disp_aug  = disp_scale_test * s_batch
+# ── DL: Transformer 모델 ───────────────────────────────────────────────────────
+class TrajTransformer(nn.Module):
+    def __init__(self, d_model: int = 64, nhead: int = 4,
+                 num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.vel_embed = nn.Linear(3, d_model)
+        self.pos_enc   = nn.Parameter(torch.zeros(10, d_model))
+        nn.init.trunc_normal_(self.pos_enc, std=0.02)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward=256,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model + 7, 128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 3),
+        )
 
-            aug_out = [make_xgb_features(t, cv, cw)
-                       for t, cv, cw in zip(trajs_aug, cv_aug, ct_w_test_raw)]
-            X_aug = np.array([o[0] for o in aug_out])
-            R_aug = np.array([o[1] for o in aug_out])
+    def forward(self, vel_seq: torch.Tensor, phys: torch.Tensor) -> torch.Tensor:
+        x = self.vel_embed(vel_seq) + self.pos_enc   # (B, 10, d_model)
+        x = self.encoder(x)[:, -1]                   # (B, d_model) — last token
+        return self.head(torch.cat([x, phys], dim=-1))
 
-            # 5개 폴드 모델 평균 예측
-            norm_res = np.zeros((n_test, 3))
-            for m in fold_models:
-                norm_res += m.predict(X_aug)
-            norm_res /= n_folds_actual
 
-            # 로컬 → 증강 글로벌 → 원본 프레임으로 역변환
-            delta_aug  = np.einsum('nji,nj->ni', R_aug,   norm_res * disp_aug[:, None])
-            delta_orig = np.einsum('nji,nj->ni', Q_batch, delta_aug) / s  # Q.T @ delta / s
-            tta_acc   += delta_orig
+# ── DL: 5-Fold 학습 ───────────────────────────────────────────────────────────
+def train_dl_5fold(log,
+                   train_data, blend_train, true_xyz,
+                   ct_results_train, disp_scale_train,
+                   test_data, blend_test, ct_results_test, disp_scale_test,
+                   N_AUG: int = 4, n_folds: int = 5,
+                   n_epochs: int = 50, batch_size: int = 256):
+    """5-Fold Transformer 학습 + 3D 회전 증강 (속력 기반 정규화)."""
+    n  = len(train_data)
+    nt = len(test_data)
+    rng = np.random.RandomState(123)
 
-        test_res_final = (test_res_orig + tta_acc / N_TTA) / 2
-    else:
-        test_res_final = test_res_orig
+    def _prep(data, ct_res, disp_sc):
+        outs = [prepare_dl_inputs(t, r[0], r[1]) for t, r in zip(data, ct_res)]
+        vel  = np.array([o[0] for o in outs])   # (N, 10, 3)
+        phy  = np.array([o[1] for o in outs])   # (N, 7)
+        Rm   = np.array([o[2] for o in outs])   # (N, 3, 3)
+        # 속력 기반 정규화 → 스케일 불변
+        vel  = (vel * (DT * HORIZON) / disp_sc[:, None, None]).astype(np.float32)
+        phy2 = phy.copy()
+        phy2[:, :6] /= disp_sc[:, None]         # ct_pred_L, ct_vs_cv_L → 무차원
+        return vel, phy2.astype(np.float32), Rm
 
-    return oof, test_res_final, imp_acc / n_folds_actual
+    vel_base, phys_base, R_base = _prep(train_data, ct_results_train, disp_scale_train)
+    vel_test, phys_test, R_test = _prep(test_data,  ct_results_test,  disp_scale_test)
+
+    # 베이스 타겟: R @ (true - blend) / disp_scale
+    res_base = true_xyz - blend_train
+    tgt_base = (np.einsum('nij,nj->ni', R_base, res_base)
+                / disp_scale_train[:, None]).astype(np.float32)
+
+    # 증강 데이터 구성
+    all_vel  = [vel_base]
+    all_phys = [phys_base]
+    all_tgt  = [tgt_base]
+
+    for _ in range(N_AUG):
+        Q_batch  = np.array([_random_rotation(rng) for _ in range(n)])
+        vel_aug  = np.zeros_like(vel_base)
+        phys_aug = np.zeros_like(phys_base)
+        tgt_aug  = np.zeros((n, 3), dtype=np.float32)
+        for i in range(n):
+            Q  = Q_batch[i]
+            tq = (Q @ train_data[i].T).T
+            cp = Q @ ct_results_train[i][0]
+            cw = ct_results_train[i][1]
+            vs, ph, Rq = prepare_dl_inputs(tq, cp, cw)
+            ds = disp_scale_train[i]
+            vel_aug[i]  = (vs * (DT * HORIZON) / ds).astype(np.float32)
+            ph2 = ph.copy(); ph2[:6] /= ds
+            phys_aug[i] = ph2.astype(np.float32)
+            res_Q = Q @ (true_xyz[i] - blend_train[i])
+            tgt_aug[i]  = (Rq @ res_Q / ds).astype(np.float32)
+        all_vel.append(vel_aug)
+        all_phys.append(phys_aug)
+        all_tgt.append(tgt_aug)
+
+    vel_all = np.concatenate(all_vel,  axis=0)   # (N*(N_AUG+1), 10, 3)
+    phy_all = np.concatenate(all_phys, axis=0)
+    tgt_all = np.concatenate(all_tgt,  axis=0)
+
+    Vt = torch.from_numpy(vel_test)
+    Pt = torch.from_numpy(phys_test)
+
+    kf           = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    oof_preds    = np.zeros_like(true_xyz)
+    test_res_acc = np.zeros((nt, 3), dtype=np.float64)
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(range(n)), 1):
+        tr_aug_idx = np.concatenate([tr_idx + n * r for r in range(N_AUG + 1)])
+        X_tr  = torch.from_numpy(vel_all[tr_aug_idx])
+        P_tr  = torch.from_numpy(phy_all[tr_aug_idx])
+        Y_tr  = torch.from_numpy(tgt_all[tr_aug_idx])
+        X_val = torch.from_numpy(vel_base[val_idx])
+        P_val = torch.from_numpy(phys_base[val_idx])
+
+        ds_tr  = TensorDataset(X_tr, P_tr, Y_tr)
+        dl_tr  = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, drop_last=False)
+
+        model = TrajTransformer()
+        opt   = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+        crit  = nn.MSELoss()
+
+        last_loss = 0.0
+        for epoch in range(n_epochs):
+            model.train()
+            ep_loss = 0.0
+            for Xb, Pb, Yb in dl_tr:
+                pred  = model(Xb, Pb)
+                loss  = crit(pred, Yb)
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                ep_loss += loss.item()
+            sched.step()
+            last_loss = ep_loss / len(dl_tr)
+
+        model.eval()
+        with torch.no_grad():
+            val_res_norm = model(X_val, P_val).numpy()
+        val_res_local  = val_res_norm * disp_scale_train[val_idx, None]
+        val_res_global = np.einsum('nji,nj->ni', R_base[val_idx], val_res_local)
+        oof_preds[val_idx] = blend_train[val_idx] + val_res_global
+        log.info(f"  [DL] Fold {fold}/{n_folds}  "
+                 f"R-Hit={r_hit(oof_preds[val_idx], true_xyz[val_idx]):.4f}  "
+                 f"loss={last_loss:.5f}  (n_tr={len(tr_aug_idx):,})")
+
+        with torch.no_grad():
+            test_res_norm = model(Vt, Pt).numpy()
+        test_res_local  = test_res_norm * disp_scale_test[:, None]
+        test_res_global = np.einsum('nji,nj->ni', R_test, test_res_local)
+        test_res_acc   += test_res_global
+
+    dl_test_res = test_res_acc / n_folds   # (nt, 3) 평균 잔차 (global)
+    return oof_preds, dl_test_res
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v22 (v21 + TTA N=8)")
+    log.info("모기 비행 궤적 예측 v23 (Transformer 시퀀스 모델)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -797,69 +849,67 @@ def main():
     labels   = pd.read_csv(LABELS_CSV, index_col='id')
     true_xyz = labels.loc[train_ids, ['x', 'y', 'z']].values
 
-    # ── 물리 모델 앵커 계산 ────────────────────────────────────────────────────
+    # ── 물리 모델 앵커 계산 (CT 결과 한 번만 계산) ────────────────────────────
     cv_preds_train = batch_cv_last(train_data)
     cv_preds_test  = batch_cv_last(test_data)
     log.info(f"[CV-last]   R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    blend_train, _, ct_w_train = batch_physics_blend(train_data)
-    blend_test,  _, _          = batch_physics_blend(test_data)
+    ct_results_train = [predict_ct(t) for t in train_data]
+    ct_w_train       = np.array([r[1] for r in ct_results_train])
+    ct_preds_train   = np.array([r[0] for r in ct_results_train])
+    blend_train      = ((1 - ct_w_train[:, None]) * cv_preds_train
+                        + ct_w_train[:, None] * ct_preds_train)
+
+    ct_results_test  = [predict_ct(t) for t in test_data]
+    ct_w_test        = np.array([r[1] for r in ct_results_test])
+    ct_preds_test    = np.array([r[0] for r in ct_results_test])
+    blend_test       = ((1 - ct_w_test[:, None]) * cv_preds_test
+                        + ct_w_test[:, None] * ct_preds_test)
+
     log.info(f"[CT-blend]  R-Hit={r_hit(blend_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(blend_train, true_xyz):.2f}cm  "
              f"(CT weight 평균: {ct_w_train.mean():.3f})")
 
-    residuals_train = true_xyz - blend_train   # 블렌드 앵커 기준 잔차
+    # ── 속력 기반 정규화 스케일 ───────────────────────────────────────────────
+    speed_train      = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in train_data])
+    disp_scale_train = np.maximum(speed_train * DT * HORIZON, 0.01)
 
-    # ── 속력 기반 잔차 정규화 스케일 ──────────────────────────────────────────
-    # 빠른 샘플과 느린 샘플의 잔차 크기를 통일 → 학습 신호 균형
-    # speed * dt = 예상 이동거리 (cm), 회전에 불변 → 증강에서도 재사용 가능
-    speed_train = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in train_data])
-    disp_scale_train = np.maximum(speed_train * DT * HORIZON, 0.01)   # (N,) cm
+    speed_test       = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in test_data])
+    disp_scale_test  = np.maximum(speed_test  * DT * HORIZON, 0.01)
 
-    speed_test = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in test_data])
-    disp_scale_test = np.maximum(speed_test * DT * HORIZON, 0.01)     # (N,) cm
-
-    log.info("피처 생성 중...")
+    # ── XGBoost 피처 (게이트 분류기 전용) ────────────────────────────────────
+    log.info("게이트 피처 생성 중...")
     train_out = [make_xgb_features(t, cv, cw)
                  for t, cv, cw in zip(train_data, cv_preds_train, ct_w_train)]
     X_train   = np.array([o[0] for o in train_out])
-    R_train   = np.array([o[1] for o in train_out])
 
-    ct_w_test = np.array([predict_ct(t)[1] for t in test_data])
     test_out  = [make_xgb_features(t, cv, cw)
                  for t, cv, cw in zip(test_data, cv_preds_test, ct_w_test)]
     X_test    = np.array([o[0] for o in test_out])
-    R_test    = np.array([o[1] for o in test_out])
 
-    feat_names = make_feature_names()
-    log.info(f"피처 수: {X_train.shape[1]}")
-    assert X_train.shape[1] == len(feat_names), \
-        f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
+    log.info(f"게이트 피처 수: {X_train.shape[1]}")
 
-    # ── 단일 모델 5-Fold 학습 + TTA ──────────────────────────────────────────
-    log.info("5-Fold XGBoost 학습 시작 (N_AUG=4, N_TTA=8)...")
-    oof_preds, xgb_test_res, imp_acc = train_group(
-        log, "All",
-        train_data, X_train, R_train,
-        blend_train, true_xyz,
-        cv_preds_train, ct_w_train, disp_scale_train,
-        X_test, R_test, disp_scale_test,
-        feat_names, N_AUG=4,
-        test_data=test_data,
-        blend_test_raw=blend_test,
-        cv_test_raw=cv_preds_test,
-        ct_w_test_raw=ct_w_test,
-        N_TTA=8,
+    n_params = sum(p.numel() for p in TrajTransformer().parameters())
+    log.info(f"Transformer 파라미터 수: {n_params:,}")
+
+    # ── 5-Fold Transformer 학습 ───────────────────────────────────────────────
+    log.info("5-Fold Transformer 학습 시작 (N_AUG=4)...")
+    oof_preds, dl_test_res = train_dl_5fold(
+        log, train_data, blend_train, true_xyz,
+        ct_results_train, disp_scale_train,
+        test_data, blend_test, ct_results_test, disp_scale_test,
+        N_AUG=4, n_epochs=50,
     )
-    log.info(f"\n[v22-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v23-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
-    # ── 메타 게이팅: XGBoost 보정이 도움되는 샘플만 선별 ──────────────────────
+    # ── 메타 게이팅: DL 보정이 도움되는 샘플만 선별 ──────────────────────────
     oof_err   = np.linalg.norm(oof_preds - true_xyz, axis=1)
     blend_err = np.linalg.norm(blend_train - true_xyz, axis=1)
-    gate_labels = (oof_err < blend_err).astype(int)   # 1=개선, 0=악화
-    log.info(f"\n[Gate] 개선={gate_labels.sum()}개  악화={(~gate_labels.astype(bool)).sum()}개  "
+    gate_labels = (oof_err < blend_err).astype(int)
+    log.info(f"\n[Gate] 개선={gate_labels.sum()}개  "
+             f"악화={(~gate_labels.astype(bool)).sum()}개  "
              f"개선율={gate_labels.mean()*100:.1f}%")
 
     gate_clf = xgb.XGBClassifier(
@@ -869,12 +919,11 @@ def main():
     )
     gate_clf.fit(X_train, gate_labels)
 
-    gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]    # (N_test,)
-    gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]   # (N_train, in-sample)
+    gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]
+    gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]
 
-    # in-sample 게이팅 효과 (낙관적이지만 방향성 확인용)
-    xgb_train_res = oof_preds - blend_train
-    oof_gated     = blend_train + gate_prob_train[:, None] * xgb_train_res
+    dl_train_res = oof_preds - blend_train
+    oof_gated    = blend_train + gate_prob_train[:, None] * dl_train_res
     log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
              f"(raw OOF={r_hit(oof_preds, true_xyz):.4f})")
 
@@ -885,23 +934,7 @@ def main():
                        train_ids, out_dir)
 
     # ── 테스트 최종 예측: soft gating 적용 ───────────────────────────────────
-    final_test = blend_test + gate_prob_test[:, None] * xgb_test_res
-
-    importances = imp_acc
-    top_idx = np.argsort(importances)[::-1][:50]
-    log.info(f"\n{'='*66}")
-    log.info("Top 50 피처 중요도 (5-fold 평균)")
-    log.info(f"{'='*66}")
-    for rank, i in enumerate(top_idx, 1):
-        name = feat_names[i] if i < len(feat_names) else f"feat_{i}"
-        log.info(f"  {rank:2d}. {name:<42s}  {importances[i]:.4f}")
-
-    pd.DataFrame({
-        'feature':         feat_names,
-        'importance_mean': importances,
-    }).sort_values('importance_mean', ascending=False).to_csv(
-        out_dir / "feature_importance_v22.csv", index=False)
-    log.info(f"\n피처 중요도 저장 → output/feature_importance_v22.csv")
+    final_test = blend_test + gate_prob_test[:, None] * dl_test_res
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -909,7 +942,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v22.csv"
+    out_sub = out_dir / "submission_dl_v23.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
