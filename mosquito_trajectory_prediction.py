@@ -33,7 +33,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v25_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v26_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -111,7 +111,7 @@ def _kalman_last_state(traj: np.ndarray,
 
 # ── CT (Constant Turn Rate) 물리 모델 ──────────────────────────────────────────
 def predict_ct(traj: np.ndarray) -> tuple[np.ndarray, float]:
-    """등속 선회율(CT) 모델: 현재 각속도 ω로 원호 경로를 예측.
+    """등속 선회율(CT) 모델: ω를 마지막 3프레임 평균으로 안정화.
     Returns (ct_pred_global, ct_weight) — ct_weight는 선회 강도 기반 신뢰도.
     """
     eps   = 1e-8
@@ -124,38 +124,69 @@ def predict_ct(traj: np.ndarray) -> tuple[np.ndarray, float]:
     speed  = float(np.linalg.norm(vels[-1]))
     v_unit = vels[-1] / (speed + eps)
 
-    # 법선 가속도 벡터 (접선 성분 제거)
+    # 법선 가속도 벡터 — 마지막 프레임 기준 (방향)
     a_t_val = float(np.dot(accs_r[-1], v_unit))
     a_n_vec = accs_r[-1] - a_t_val * v_unit
     a_n_mag = float(np.linalg.norm(a_n_vec))
 
-    omega   = a_n_mag / (speed + eps)   # rad/s
-    theta   = omega * dt                # 80ms 동안 회전각
+    # [v26] ω 안정화: 마지막 3프레임 ω 평균 (단일 프레임 노이즈 감소)
+    omega_vals = []
+    for k in range(-3, 0):
+        v_k  = vels[k]
+        sp_k = float(np.linalg.norm(v_k))
+        vu_k = v_k / (sp_k + eps)
+        a_k  = accs_r[k]
+        at_k = float(np.dot(a_k, vu_k))
+        an_k = float(np.linalg.norm(a_k - at_k * vu_k))
+        omega_vals.append(an_k / (sp_k + eps))
+    omega = float(np.mean(omega_vals))
+    theta = omega * dt
 
     if omega < 1e-6 or speed < 1e-6:
         ct_L = vels[-1] * dt            # 퇴화 → CV와 동일
     else:
         R_curve = speed / (omega + eps)
         n_hat   = a_n_vec / (a_n_mag + eps)
-        # 원호 위치: 전진 성분 + 법선 성분
         ct_L = R_curve * np.sin(theta) * v_unit + R_curve * (1 - np.cos(theta)) * n_hat
 
-    ct_pred = traj[-1] + ct_L @ R      # 로컬 → 글로벌
-
-    # 신뢰도: 회전각이 클수록 CT가 CV보다 유리 (45도에서 포화)
+    ct_pred   = traj[-1] + ct_L @ R    # 로컬 → 글로벌
     ct_weight = float(np.clip(theta / (np.pi / 4), 0.0, 1.0))
     return ct_pred, ct_weight
 
 
-def batch_physics_blend(data: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """CV + CT 적응 블렌드 앵커. Returns (blend, cv_preds, ct_weights)."""
-    cv_preds  = np.array([predict_cv_last(t) for t in data])
+def _speed_trend_inner(cv_pred: np.ndarray, traj: np.ndarray) -> tuple[np.ndarray, float]:
+    """[v26] 접선 가속도 보정 CV: cv_trend = cv + 0.5*a_t*v_unit*dt^2.
+    Returns (inner_blend, trend_weight).
+    """
+    eps  = 1e-8
+    dt   = DT * HORIZON
+    vg   = np.diff(traj, axis=0) / DT          # (10, 3)
+    ag   = np.diff(vg,   axis=0) / DT          # (9, 3)
+    spd  = float(np.linalg.norm(vg[-1]))
+    vu   = vg[-1] / (spd + eps)
+    a_t  = float(np.dot(ag[-1], vu))           # 접선 가속도
+    # 접선 방향만 반영 → 원심력 오염 없음
+    cv_trend = cv_pred + 0.5 * a_t * vu * dt**2
+    # 가중치: |속력 변화율| 기준, 0~0.4 범위
+    trend_w  = float(np.clip(abs(a_t) * dt / (spd + eps), 0.0, 0.4))
+    inner    = (1.0 - trend_w) * cv_pred + trend_w * cv_trend
+    return inner, trend_w
+
+
+def batch_physics_blend(data: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """[v26] speed-trend inner + CT 2-layer 블렌드.
+    Returns (blend, cv_preds, ct_weights, trend_weights).
+    """
+    cv_preds   = np.array([predict_cv_last(t) for t in data])
     ct_results = [predict_ct(t) for t in data]
-    ct_preds  = np.array([r[0] for r in ct_results])
-    ct_weights = np.array([r[1] for r in ct_results])          # (N,)
-    w = ct_weights[:, None]                                      # (N, 1) for broadcast
-    blend = (1 - w) * cv_preds + w * ct_preds
-    return blend, cv_preds, ct_weights
+    ct_preds   = np.array([r[0] for r in ct_results])
+    ct_weights = np.array([r[1] for r in ct_results])
+    trend_res  = [_speed_trend_inner(cv, t) for cv, t in zip(cv_preds, data)]
+    inner_preds = np.array([r[0] for r in trend_res])
+    trend_ws    = np.array([r[1] for r in trend_res])
+    w    = ct_weights[:, None]
+    blend = (1 - w) * inner_preds + w * ct_preds
+    return blend, cv_preds, ct_weights, trend_ws
 
 
 # ── CA (Constant Acceleration) Kalman 앵커 ────────────────────────────────────
@@ -605,7 +636,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v25.csv"
+    save_path = out_dir / "oof_analysis_v26.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -913,7 +944,7 @@ def train_dl_5fold(log,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v25 (CV+CT 블렌드 + cv_smooth 피처 + XGBoost 게이팅)")
+    log.info("모기 비행 궤적 예측 v26 (ω 안정화 + speed-trend 블렌드 + 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -929,25 +960,14 @@ def main():
     log.info(f"[CV-last]   R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    # ── 2. CT 모델 ───────────────────────────────────────────────────────────
-    ct_results_train = [predict_ct(t) for t in train_data]
-    ct_preds_train   = np.array([r[0] for r in ct_results_train])
-    ct_w_train       = np.array([r[1] for r in ct_results_train])
-
-    ct_results_test  = [predict_ct(t) for t in test_data]
-    ct_preds_test    = np.array([r[0] for r in ct_results_test])
-    ct_w_test        = np.array([r[1] for r in ct_results_test])
-
-    # ── 3. 2-way 블렌드 앵커 (CV + CT) ──────────────────────────────────────
-    w_tr          = ct_w_train[:, None]
-    blend_train   = (1 - w_tr) * cv_preds_train + w_tr * ct_preds_train
-    w_te          = ct_w_test[:, None]
-    blend_test    = (1 - w_te) * cv_preds_test  + w_te * ct_preds_test
-    log.info(f"[CT-blend]  R-Hit={r_hit(blend_train, true_xyz):.4f}  "
+    # ── 2. [v26] ω 안정화 CT + speed-trend 2-layer 블렌드 ───────────────────
+    blend_train, _, ct_w_train, trend_w_train = batch_physics_blend(train_data)
+    blend_test,  _, ct_w_test,  trend_w_test  = batch_physics_blend(test_data)
+    log.info(f"[v26-blend] R-Hit={r_hit(blend_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(blend_train, true_xyz):.2f}cm  "
-             f"(CT weight 평균: {ct_w_train.mean():.3f})")
+             f"(CT avg: {ct_w_train.mean():.3f}  trend avg: {trend_w_train.mean():.3f})")
 
-    # ── 4. Kalman 스무딩 → cv_smooth 피처 ───────────────────────────────────
+    # ── 3. Kalman 스무딩 → cv_smooth 피처 ───────────────────────────────────
     log.info("Kalman 스무딩 계산 중...")
     ka_results_train = [predict_ca_kf(t) for t in train_data]
     cv_smooth_train  = np.array([r[2] for r in ka_results_train])
@@ -957,14 +977,14 @@ def main():
     log.info(f"[CV-smooth] R-Hit={r_hit(cv_smooth_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_smooth_train, true_xyz):.2f}cm")
 
-    # ── 5. 속력 기반 정규화 스케일 ──────────────────────────────────────────
+    # ── 4. 속력 기반 정규화 스케일 ──────────────────────────────────────────
     speed_train      = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in train_data])
     disp_scale_train = np.maximum(speed_train * DT * HORIZON, 0.01)
 
     speed_test       = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in test_data])
     disp_scale_test  = np.maximum(speed_test  * DT * HORIZON, 0.01)
 
-    # ── 6. XGBoost 피처 ─────────────────────────────────────────────────────
+    # ── 5. XGBoost 피처 ─────────────────────────────────────────────────────
     log.info("피처 생성 중...")
     train_out = [make_xgb_features(t, cv, cw, cvs)
                  for t, cv, cw, cvs in zip(
@@ -982,7 +1002,7 @@ def main():
     log.info(f"피처 수: {X_train.shape[1]}")
     assert X_train.shape[1] == len(feat_names),         f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
 
-    # ── 7. 5-Fold XGBoost 학습 ──────────────────────────────────────────────
+    # ── 6. 5-Fold XGBoost 학습 ──────────────────────────────────────────────
     log.info("5-Fold XGBoost 학습 시작 (N_AUG=4)...")
     oof_preds, xgb_test_res, imp_acc = train_group(
         log, "All",
@@ -995,10 +1015,10 @@ def main():
         cv_smooth_test=cv_smooth_test,
         N_AUG=4,
     )
-    log.info(f"\n[v25-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v26-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
-    # ── 8. 메타 게이팅 ───────────────────────────────────────────────────────
+    # ── 7. 메타 게이팅 ───────────────────────────────────────────────────────
     oof_err   = np.linalg.norm(oof_preds - true_xyz, axis=1)
     blend_err = np.linalg.norm(blend_train - true_xyz, axis=1)
     gate_labels = (oof_err < blend_err).astype(int)
@@ -1027,7 +1047,7 @@ def main():
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
-    # ── 9. 피처 중요도 ────────────────────────────────────────────────────────
+    # ── 8. 피처 중요도 ────────────────────────────────────────────────────────
     top_idx = np.argsort(imp_acc)[::-1][:50]
     log.info(f"\n{'='*66}")
     log.info("Top 50 피처 중요도 (5-fold 평균)")
@@ -1036,10 +1056,10 @@ def main():
         log.info(f"  {rank:2d}. {feat_names[i]:<42s}  {imp_acc[i]:.4f}")
     pd.DataFrame({'feature': feat_names, 'importance_mean': imp_acc}
                  ).sort_values('importance_mean', ascending=False
-                               ).to_csv(out_dir / "feature_importance_v25.csv", index=False)
-    log.info("피처 중요도 저장 → output/feature_importance_v25.csv")
+                               ).to_csv(out_dir / "feature_importance_v26.csv", index=False)
+    log.info("피처 중요도 저장 → output/feature_importance_v26.csv")
 
-    # ── 10. 최종 예측 ────────────────────────────────────────────────────────
+    # ── 9. 최종 예측 ─────────────────────────────────────────────────────────
     final_test = blend_test + gate_prob_test[:, None] * xgb_test_res
 
     sub      = pd.read_csv(SAMPLE_SUB)
@@ -1048,7 +1068,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v25.csv"
+    out_sub = out_dir / "submission_xgb_v26.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
