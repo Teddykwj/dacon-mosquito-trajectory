@@ -33,7 +33,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v24_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v25_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -218,8 +218,6 @@ def _vel_r2(vels: np.ndarray) -> np.ndarray:
 def make_xgb_features(traj: np.ndarray,
                        cv_pred: np.ndarray,
                        ct_weight: float = 0.0,
-                       ca_pred: np.ndarray = None,
-                       ca_weight: float = 0.0,
                        cv_smooth: np.ndarray = None) -> tuple[np.ndarray, np.ndarray]:
     vels_g = np.diff(traj, axis=0) / DT
     R      = _local_frame_rotation(vels_g[-1])
@@ -433,17 +431,11 @@ def make_xgb_features(traj: np.ndarray,
         ct_vs_cv_L,             # (3) CT - CV 차이 (선회 보정량)
         [ct_weight],            # (1) 선회 강도 기반 CT 신뢰도
 
-        # ── [NEW] CA-KF + CV-smooth 피처 ─────────────────────────────────────
-        *(((ca_pred   - traj[-1]) @ R.T,                    # ca_kf_pred_L (3)
-           (ca_pred   - traj[-1]) @ R.T - cv_L,             # ca_kf_vs_cv_L (3)
-           (ca_pred   - traj[-1]) @ R.T - ct_pred_L,        # ca_kf_vs_ct_L (3)
-           [ca_weight],                                      # ca_kf_weight  (1)
-           (cv_smooth - traj[-1]) @ R.T,                    # cv_smooth_L   (3)
+        # ── [NEW] CV-smooth 피처 (Kalman 스무딩 속도 기반) ──────────────────────
+        *(((cv_smooth - traj[-1]) @ R.T,                    # cv_smooth_L (3)
            (cv_smooth - traj[-1]) @ R.T - cv_L,             # cv_smooth_vs_raw_L (3)
-           ) if ca_pred is not None else
-          (np.zeros(3), np.zeros(3), np.zeros(3),
-           [0.0],
-           np.zeros(3), np.zeros(3))),
+           ) if cv_smooth is not None else
+          (np.zeros(3), np.zeros(3))),
     ])
     return feats.astype(np.float32), R
 
@@ -547,11 +539,7 @@ def make_feature_names() -> list[str]:
     for ax in axes: N.append(f"ct_vs_cv_{ax}")
     N += ["ct_weight"]
 
-    # [NEW] CA-KF + CV-smooth 피처
-    for ax in axes: N.append(f"ca_kf_pred_{ax}")
-    for ax in axes: N.append(f"ca_kf_vs_cv_{ax}")
-    for ax in axes: N.append(f"ca_kf_vs_ct_{ax}")
-    N += ["ca_kf_weight"]
+    # [NEW] CV-smooth 피처
     for ax in axes: N.append(f"cv_smooth_{ax}")
     for ax in axes: N.append(f"cv_smooth_vs_raw_{ax}")
     return N
@@ -617,7 +605,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v24.csv"
+    save_path = out_dir / "oof_analysis_v25.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -696,13 +684,11 @@ def train_group(log, label,
                 blend_g, true_xyz_g, cv_preds_g, ct_w_g, disp_scale_g,
                 X_test, R_test, disp_scale_test,
                 feat_names,
-                ca_preds_g=None, ca_w_g=None, cv_smooth_g=None,
-                ca_preds_test=None, ca_w_test=None, cv_smooth_test=None,
+                cv_smooth_g=None, cv_smooth_test=None,
                 N_AUG=4, n_folds=5):
-    """속력 그룹별 독립 증강 + 5-Fold 학습."""
+    """5-Fold 학습 + 3D 회전 증강."""
     n = len(train_data_g)
     rng = np.random.RandomState(123)
-    has_ca = ca_preds_g is not None
 
     all_X     = [X_g];         all_R     = [R_g]
     all_blend = [blend_g];     all_true  = [true_xyz_g]
@@ -714,15 +700,10 @@ def train_group(log, label,
         true_rot  = np.einsum('nij,nj->ni', Q_batch, true_xyz_g)
         blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_g)
         cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_preds_g)
-        if has_ca:
-            ca_rot   = np.einsum('nij,nj->ni', Q_batch, ca_preds_g)
-            cv_sm_rot = np.einsum('nij,nj->ni', Q_batch, cv_smooth_g)
-            aug_out  = [make_xgb_features(t, cv, cw, ca, caw, cvs)
-                        for t, cv, cw, ca, caw, cvs in zip(
-                            trajs_rot, cv_rot, ct_w_g, ca_rot, ca_w_g, cv_sm_rot)]
-        else:
-            aug_out   = [make_xgb_features(t, cv, cw)
-                         for t, cv, cw in zip(trajs_rot, cv_rot, ct_w_g)]
+        cv_sm_rot = (np.einsum('nij,nj->ni', Q_batch, cv_smooth_g)
+                     if cv_smooth_g is not None else [None] * n)
+        aug_out   = [make_xgb_features(t, cv, cw, cvs)
+                     for t, cv, cw, cvs in zip(trajs_rot, cv_rot, ct_w_g, cv_sm_rot)]
         all_X.append(np.array([o[0] for o in aug_out]))
         all_R.append(np.array([o[1] for o in aug_out]))
         all_blend.append(blend_rot)
@@ -928,11 +909,11 @@ def train_dl_5fold(log,
     return oof_preds, dl_test_res
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v24 (Kalman CA 앵커 + XGBoost + 게이팅)")
+    log.info("모기 비행 궤적 예측 v25 (CV+CT 블렌드 + cv_smooth 피처 + XGBoost 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -942,13 +923,13 @@ def main():
     labels   = pd.read_csv(LABELS_CSV, index_col='id')
     true_xyz = labels.loc[train_ids, ['x', 'y', 'z']].values
 
-    # ── 1. CV 기준선 ──────────────────────────────────────────────────────────
+    # ── 1. CV 기준선 ─────────────────────────────────────────────────────────
     cv_preds_train = batch_cv_last(train_data)
     cv_preds_test  = batch_cv_last(test_data)
-    log.info(f"[CV-last]    R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
+    log.info(f"[CV-last]   R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    # ── 2. CT 모델 ────────────────────────────────────────────────────────────
+    # ── 2. CT 모델 ───────────────────────────────────────────────────────────
     ct_results_train = [predict_ct(t) for t in train_data]
     ct_preds_train   = np.array([r[0] for r in ct_results_train])
     ct_w_train       = np.array([r[1] for r in ct_results_train])
@@ -957,68 +938,51 @@ def main():
     ct_preds_test    = np.array([r[0] for r in ct_results_test])
     ct_w_test        = np.array([r[1] for r in ct_results_test])
 
-    # ── 3. Kalman CA 모델 ─────────────────────────────────────────────────────
-    log.info("Kalman 스무딩 + CA 앵커 계산 중...")
-    ca_results_train  = [predict_ca_kf(t) for t in train_data]
-    ca_preds_train    = np.array([r[0] for r in ca_results_train])
-    ca_w_train        = np.array([r[1] for r in ca_results_train])
-    cv_smooth_train   = np.array([r[2] for r in ca_results_train])
-
-    ca_results_test   = [predict_ca_kf(t) for t in test_data]
-    ca_preds_test     = np.array([r[0] for r in ca_results_test])
-    ca_w_test         = np.array([r[1] for r in ca_results_test])
-    cv_smooth_test    = np.array([r[2] for r in ca_results_test])
-
-    log.info(f"[CV-smooth]  R-Hit={r_hit(cv_smooth_train, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(cv_smooth_train, true_xyz):.2f}cm")
-    log.info(f"[CA-KF]      R-Hit={r_hit(ca_preds_train, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(ca_preds_train, true_xyz):.2f}cm  "
-             f"(CA weight 평균: {ca_w_train.mean():.3f})")
-
-    # ── 4. 3-way 블렌드 앵커 ─────────────────────────────────────────────────
-    # blend = (1-ct_w)*[(1-ca_w)*cv_smooth + ca_w*ca] + ct_w*ct
-    def _blend3(cv_sm, ca, ct, ct_w, ca_w):
-        cw = ct_w[:, None]; aw = ca_w[:, None]
-        return (1 - cw) * ((1 - aw) * cv_sm + aw * ca) + cw * ct
-
-    blend_train = _blend3(cv_smooth_train, ca_preds_train, ct_preds_train,
-                          ct_w_train, ca_w_train)
-    blend_test  = _blend3(cv_smooth_test,  ca_preds_test,  ct_preds_test,
-                          ct_w_test,  ca_w_test)
-
-    log.info(f"[3-way blend] R-Hit={r_hit(blend_train, true_xyz):.4f}  "
+    # ── 3. 2-way 블렌드 앵커 (CV + CT) ──────────────────────────────────────
+    w_tr          = ct_w_train[:, None]
+    blend_train   = (1 - w_tr) * cv_preds_train + w_tr * ct_preds_train
+    w_te          = ct_w_test[:, None]
+    blend_test    = (1 - w_te) * cv_preds_test  + w_te * ct_preds_test
+    log.info(f"[CT-blend]  R-Hit={r_hit(blend_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(blend_train, true_xyz):.2f}cm  "
-             f"(CT avg: {ct_w_train.mean():.3f}  CA avg: {ca_w_train.mean():.3f})")
+             f"(CT weight 평균: {ct_w_train.mean():.3f})")
 
-    # ── 5. 속력 기반 정규화 스케일 ────────────────────────────────────────────
+    # ── 4. Kalman 스무딩 → cv_smooth 피처 ───────────────────────────────────
+    log.info("Kalman 스무딩 계산 중...")
+    ka_results_train = [predict_ca_kf(t) for t in train_data]
+    cv_smooth_train  = np.array([r[2] for r in ka_results_train])
+
+    ka_results_test  = [predict_ca_kf(t) for t in test_data]
+    cv_smooth_test   = np.array([r[2] for r in ka_results_test])
+    log.info(f"[CV-smooth] R-Hit={r_hit(cv_smooth_train, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(cv_smooth_train, true_xyz):.2f}cm")
+
+    # ── 5. 속력 기반 정규화 스케일 ──────────────────────────────────────────
     speed_train      = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in train_data])
     disp_scale_train = np.maximum(speed_train * DT * HORIZON, 0.01)
 
     speed_test       = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in test_data])
     disp_scale_test  = np.maximum(speed_test  * DT * HORIZON, 0.01)
 
-    # ── 6. XGBoost 피처 (CA 피처 포함) ───────────────────────────────────────
+    # ── 6. XGBoost 피처 ─────────────────────────────────────────────────────
     log.info("피처 생성 중...")
-    train_out = [make_xgb_features(t, cv, cw, ca, caw, cvs)
-                 for t, cv, cw, ca, caw, cvs in zip(
-                     train_data, cv_preds_train, ct_w_train,
-                     ca_preds_train, ca_w_train, cv_smooth_train)]
+    train_out = [make_xgb_features(t, cv, cw, cvs)
+                 for t, cv, cw, cvs in zip(
+                     train_data, cv_preds_train, ct_w_train, cv_smooth_train)]
     X_train   = np.array([o[0] for o in train_out])
     R_train   = np.array([o[1] for o in train_out])
 
-    test_out  = [make_xgb_features(t, cv, cw, ca, caw, cvs)
-                 for t, cv, cw, ca, caw, cvs in zip(
-                     test_data, cv_preds_test, ct_w_test,
-                     ca_preds_test, ca_w_test, cv_smooth_test)]
+    test_out  = [make_xgb_features(t, cv, cw, cvs)
+                 for t, cv, cw, cvs in zip(
+                     test_data, cv_preds_test, ct_w_test, cv_smooth_test)]
     X_test    = np.array([o[0] for o in test_out])
     R_test    = np.array([o[1] for o in test_out])
 
     feat_names = make_feature_names()
     log.info(f"피처 수: {X_train.shape[1]}")
-    assert X_train.shape[1] == len(feat_names), \
-        f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
+    assert X_train.shape[1] == len(feat_names),         f"피처 불일치: {X_train.shape[1]} vs {len(feat_names)}"
 
-    # ── 7. 5-Fold XGBoost 학습 ───────────────────────────────────────────────
+    # ── 7. 5-Fold XGBoost 학습 ──────────────────────────────────────────────
     log.info("5-Fold XGBoost 학습 시작 (N_AUG=4)...")
     oof_preds, xgb_test_res, imp_acc = train_group(
         log, "All",
@@ -1027,14 +991,14 @@ def main():
         cv_preds_train, ct_w_train, disp_scale_train,
         X_test, R_test, disp_scale_test,
         feat_names,
-        ca_preds_g=ca_preds_train, ca_w_g=ca_w_train, cv_smooth_g=cv_smooth_train,
-        ca_preds_test=ca_preds_test, ca_w_test=ca_w_test, cv_smooth_test=cv_smooth_test,
+        cv_smooth_g=cv_smooth_train,
+        cv_smooth_test=cv_smooth_test,
         N_AUG=4,
     )
-    log.info(f"\n[v24-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v25-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
-    # ── 8. 메타 게이팅 ────────────────────────────────────────────────────────
+    # ── 8. 메타 게이팅 ───────────────────────────────────────────────────────
     oof_err   = np.linalg.norm(oof_preds - true_xyz, axis=1)
     blend_err = np.linalg.norm(blend_train - true_xyz, axis=1)
     gate_labels = (oof_err < blend_err).astype(int)
@@ -1063,7 +1027,7 @@ def main():
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
-    # ── 9. 피처 중요도 ─────────────────────────────────────────────────────────
+    # ── 9. 피처 중요도 ────────────────────────────────────────────────────────
     top_idx = np.argsort(imp_acc)[::-1][:50]
     log.info(f"\n{'='*66}")
     log.info("Top 50 피처 중요도 (5-fold 평균)")
@@ -1072,10 +1036,10 @@ def main():
         log.info(f"  {rank:2d}. {feat_names[i]:<42s}  {imp_acc[i]:.4f}")
     pd.DataFrame({'feature': feat_names, 'importance_mean': imp_acc}
                  ).sort_values('importance_mean', ascending=False
-                               ).to_csv(out_dir / "feature_importance_v24.csv", index=False)
-    log.info("피처 중요도 저장 → output/feature_importance_v24.csv")
+                               ).to_csv(out_dir / "feature_importance_v25.csv", index=False)
+    log.info("피처 중요도 저장 → output/feature_importance_v25.csv")
 
-    # ── 10. 최종 예측 ─────────────────────────────────────────────────────────
+    # ── 10. 최종 예측 ────────────────────────────────────────────────────────
     final_test = blend_test + gate_prob_test[:, None] * xgb_test_res
 
     sub      = pd.read_csv(SAMPLE_SUB)
@@ -1084,7 +1048,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v24.csv"
+    out_sub = out_dir / "submission_xgb_v25.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)

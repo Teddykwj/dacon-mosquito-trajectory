@@ -1,0 +1,120 @@
+docker compose logs -f
+mosquito-1  | 13:10:35  ==================================================================
+mosquito-1  | 13:10:35  모기 비행 궤 적 예측 v25 (CV+CT 블렌드 + cv_smooth 피처 + XGBoost 게이팅)
+mosquito-1  | 13:10:35  ==================================================================
+mosquito-1  | 13:10:45  Train: 10000 개  |  Test: 10000개
+mosquito-1  | 13:10:45  [CV-last]   R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 13:10:46  [CT-blend]  R-Hit=0.5385  MeanDist=1.40cm  (CT weight 평균: 0.371)
+mosquito-1  | 13:10:46  Kalman 스무딩 계산 중...
+mosquito-1  | 13:10:48  [CV-smooth] R-Hit=0.5812  MeanDist=1.36cm
+mosquito-1  | 13:10:48  피처 생성 중...
+mosquito-1  | 13:11:00  피처 수: 383
+mosquito-1  | 13:11:00  5-Fold XGBoost 학습 시작 (N_AUG=4)...
+mosquito-1  | 13:11:58    [All] Fold 1/5  R-Hit=0.6220  (n_tr=40,000)
+mosquito-1  | 13:12:32    [All] Fold 2/5  R-Hit=0.6185  (n_tr=40,000)
+mosquito-1  | 13:13:06    [All] Fold 3/5  R-Hit=0.6165  (n_tr=40,000)
+mosquito-1  | 13:13:40    [All] Fold 4/5  R-Hit=0.6145  (n_tr=40,000)
+mosquito-1  | 13:14:14    [All] Fold 5/5  R-Hit=0.6025  (n_tr=40,000)
+mosquito-1  | 13:14:14  
+mosquito-1  | [v25-OOF]  R-Hit=0.6148  MeanDist=1.20cm
+mosquito-1  | 13:14:14  
+mosquito-1  | [Gate] 개선=6269개  악 화=3731개  개선율=62.7%
+mosquito-1  | 13:14:17  [OOF-Gated] R-Hit=0.6378  (raw OOF=0.6148)
+mosquito-1  | 13:14:18  
+mosquito-1  | OOF 분석 저장 → output/oof_analysis_v25.csv
+mosquito-1  | 13:14:18  
+mosquito-1  | [에러 분포 (cm)]
+mosquito-1  | 13:14:18    p25=0.41  p50=0.77  p75=1.36  p90=2.55  p95=3.91  p99=7.57
+mosquito-1  | 13:14:18    R-Hit@1cm=0.6148  (mean=1.20cm  max=17.08cm)
+mosquito-1  | 13:14:18  
+mosquito-1  | [속력 구간별 R-Hit]  (speed_last 기준 5분위)
+mosquito-1  | 13:14:18    Q1(느림): R-Hit=0.861  mean_err=0.56cm  n=2000
+mosquito-1  | 13:14:18    Q2: R-Hit=0.746  mean_err=0.88cm  n=2000
+mosquito-1  | 13:14:18    Q3: R-Hit=0.627  mean_err=1.16cm  n=2000
+mosquito-1  | 13:14:18    Q4: R-Hit=0.491  mean_err=1.52cm  n=2000
+mosquito-1  | 13:14:18    Q5(빠름): R-Hit=0.348  mean_err=1.91cm  n=2000
+mosquito-1  | 13:14:18  
+mosquito-1  | [곡률 구간별 R-Hit]  (kappa_last 기준 5분위)
+mosquito-1  | 13:14:18    Q1(직진): R-Hit=0.585  mean_err=1.24cm  n=2000
+mosquito-1  | 13:14:18    Q2: R-Hit=0.601  mean_err=1.24cm  n=2000
+mosquito-1  | 13:14:18    Q3: R-Hit=0.661  mean_err=1.10cm  n=2000
+mosquito-1  | 13:14:18    Q4: R-Hit=0.643  mean_err=1.11cm  n=2000
+mosquito-1  | 13:14:18    Q5(급선회): R-Hit=0.583  mean_err=1.32cm  n=2000
+mosquito-1  | 13:14:18  
+mosquito-1  | [CT weight 구간별 R-Hit]  (선회 강도)
+mosquito-1  | 13:14:18    직진(0~0.1): R-Hit=0.730  mean_err=0.90cm  n=1139
+mosquito-1  | 13:14:18    약선회(0.1~0.3): R-Hit=0.692  mean_err=1.00cm  n=4388
+mosquito-1  | 13:14:18    중선회(0.3~0.6): R-Hit=0.593  mean_err=1.22cm  n=2531
+mosquito-1  | 13:14:18    강선회(0.6~1.0): R-Hit=0.402  mean_err=1.83cm  n=1942
+mosquito-1  | 13:14:18  
+mosquito-1  | [속력 추세별 R-Hit]
+mosquito-1  | 13:14:18    감속: R-Hit=0.654  mean_err=1.10cm  n=3334
+mosquito-1  | 13:14:18    등속: R-Hit=0.674  mean_err=1.03cm  n=3333
+mosquito-1  | 13:14:18    가속: R-Hit=0.517  mean_err=1.48cm  n=3333
+mosquito-1  | 13:14:18  
+mosquito-1  | [CV-last 대비]
+mosquito-1  | 13:14:18    개선된 샘플: 4592개 (45.9%)  평균 개선량=0.49cm
+mosquito-1  | 13:14:18    악화된 샘플: 3551개 (35.5%)  평균 악화량=0.37cm
+mosquito-1  | 13:14:18  
+mosquito-1  | [최악 200개 샘플 평균  특성]  (error_cm 기준)
+mosquito-1  | 13:14:18    speed_last=0.94  kappa_last=16.1261  ct_weight=0.491
+mosquito-1  | 13:14:18    straightness=0.805  turn_cos_last=0.872
+mosquito-1  | 13:14:18    전체 대비: speed=0.64  kappa=13.4572  ct_w=0.371
+mosquito-1  | 13:14:18  
+mosquito-1  | ==================================================================
+mosquito-1  | 13:14:18  Top 50 피처  중요도 (5-fold 평균)
+mosquito-1  | 13:14:18  ==================================================================
+mosquito-1  | 13:14:18     1. ca_vs_cv_x                                  0.0202
+mosquito-1  | 13:14:18     2. speed_last                                  0.0179
+mosquito-1  | 13:14:18     3. vel_x_t8                                    0.0177
+mosquito-1  | 13:14:18     4. ct_pred_z                                   0.0152
+mosquito-1  | 13:14:18     5. ca_pred_z                                   0.0149
+mosquito-1  | 13:14:18     6. ct_vs_cv_y                                  0.0146
+mosquito-1  | 13:14:18     7. turn_cos_t9                                 0.0139
+mosquito-1  | 13:14:18     8. vel_lat_recent                              0.0137
+mosquito-1  | 13:14:18     9. ct_pred_y                                   0.0134
+mosquito-1  | 13:14:18    10. omega_t9                                    0.0122
+mosquito-1  | 13:14:18    11. ct_pred_x                                   0.0109
+mosquito-1  | 13:14:18    12. cv_last_delta_x                             0.0105
+mosquito-1  | 13:14:18    13. ct_weight                                   0.0100
+mosquito-1  | 13:14:18    14. a_t_t9                                      0.0096
+mosquito-1  | 13:14:18    15. speed_delta_t9                              0.0095
+mosquito-1  | 13:14:18    16. acc_x_t9                                    0.0094
+mosquito-1  | 13:14:18    17. omega_last                                  0.0085
+mosquito-1  | 13:14:18    18. pos_z_t8                                    0.0083
+mosquito-1  | 13:14:18    19. turn_last                                   0.0081
+mosquito-1  | 13:14:18    20. pos_y_t8                                    0.0074
+mosquito-1  | 13:14:18    21. last_vel_unit_x                             0.0073
+mosquito-1  | 13:14:18    22. ct_vs_cv_z                                  0.0071
+mosquito-1  | 13:14:18    23. cv_smooth_x                                 0.0065
+mosquito-1  | 13:14:18    24. pos_x_t7                                    0.0059
+mosquito-1  | 13:14:18    25. kappa_t9                                    0.0055
+mosquito-1  | 13:14:18    26. cv_exp_delta_y                              0.0055
+mosquito-1  | 13:14:18    27. pos_x_t9                                    0.0054
+mosquito-1  | 13:14:18    28. cv_smooth_vs_raw_x                          0.0054
+mosquito-1  | 13:14:18    29. ca_pred_x                                   0.0052
+mosquito-1  | 13:14:18    30. acc_y_t9                                    0.0052
+mosquito-1  | 13:14:18    31. cv_all_delta_z                              0.0051
+mosquito-1  | 13:14:18    32. recent_acc_x                                0.0051
+mosquito-1  | 13:14:18    33. jerk_x_t9                                   0.0050
+mosquito-1  | 13:14:18    34. kappa_last                                  0.0048
+mosquito-1  | 13:14:18    35. speed_t6                                    0.0048
+mosquito-1  | 13:14:18    36. speed_ratio                                 0.0047
+mosquito-1  | 13:14:18    37. cv_all_delta_y                              0.0047
+mosquito-1  | 13:14:18    38. turn_trend                                  0.0046
+mosquito-1  | 13:14:18    39. vel_vert_recent                             0.0046
+mosquito-1  | 13:14:18    40. speed_t9                                    0.0046
+mosquito-1  | 13:14:18    41. quad_delta_x                                0.0045
+mosquito-1  | 13:14:18    42. kappa_t8                                    0.0044
+mosquito-1  | 13:14:18    43. kappa_xy_last                               0.0040
+mosquito-1  | 13:14:18    44. cv_short_long_div_x                         0.0040
+mosquito-1  | 13:14:18    45. vel_y_t8                                    0.0040
+mosquito-1  | 13:14:18    46. a_n_t8                                      0.0040
+mosquito-1  | 13:14:18    47. pos_x_t8                                    0.0040
+mosquito-1  | 13:14:18    48. vel_x_t9                                    0.0039
+mosquito-1  | 13:14:18    49. vel_z_t8                                    0.0039
+mosquito-1  | 13:14:18    50. straightness                                0.0038
+mosquito-1  | 13:14:18  피처 중요도  저장 → output/feature_importance_v25.csv
+mosquito-1  | 13:14:18  제출 파일 저 장 → output/submission_xgb_v25.csv
+mosquito-1  | 13:14:18  완료
+mosquito-1 exited with code 0
