@@ -33,7 +33,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v27_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v28_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -636,7 +636,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v27.csv"
+    save_path = out_dir / "oof_analysis_v28.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -795,17 +795,17 @@ def prepare_dl_inputs(traj: np.ndarray,
     return vel_seq, phys, R
 
 
-# ── DL: GRU 모델 (ultra-small, ~5K params) ──────────────────────────────────────
+# ── DL: GRU 모델 (~68K params) ──────────────────────────────────────────────────
 class TrajGRU(nn.Module):
-    def __init__(self, hidden: int = 32, dropout: float = 0.25):
+    def __init__(self, hidden: int = 128, dropout: float = 0.25):
         super().__init__()
         self.gru  = nn.GRU(3, hidden, num_layers=1, batch_first=True)
         self.drop = nn.Dropout(dropout)
         self.head = nn.Sequential(
-            nn.Linear(hidden + 7, 64),
+            nn.Linear(hidden + 7, 128),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 3),
+            nn.Linear(128, 3),
         )
 
     def forward(self, vel_seq: torch.Tensor, phys: torch.Tensor) -> torch.Tensor:
@@ -819,9 +819,9 @@ def train_gru_5fold(log,
                     train_data, blend_train, true_xyz,
                     ct_results_train, disp_scale_train,
                     test_data, blend_test, ct_results_test, disp_scale_test,
-                    N_AUG: int = 9, n_folds: int = 5,
+                    N_AUG: int = 19, n_folds: int = 5,
                     n_epochs: int = 100, batch_size: int = 512):
-    """5-Fold GRU 학습 + 3D 회전 증강 (속력 기반 정규화, N_AUG=9 → 100K 샘플)."""
+    """5-Fold GRU 학습 + 3D 회전 증강 (속력 기반 정규화, N_AUG=19 → 200K 샘플)."""
     n  = len(train_data)
     nt = len(test_data)
     rng = np.random.RandomState(123)
@@ -937,7 +937,7 @@ def train_gru_5fold(log,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v27 (Ultra-small GRU + N_AUG=9 + 게이팅)")
+    log.info("모기 비행 궤적 예측 v28 (GRU-128 + N_AUG=19 + 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -980,15 +980,15 @@ def main():
     # ── 4. GRU 학습 (N_AUG=9, 100 epochs) ──────────────────────────────────
     n_gru_params = sum(p.numel() for p in TrajGRU().parameters())
     log.info(f"GRU 파라미터 수: {n_gru_params:,}")
-    log.info("5-Fold GRU 학습 시작 (N_AUG=9, ~100K 증강 샘플)...")
+    log.info("5-Fold GRU 학습 시작 (N_AUG=19, ~200K 증강 샘플)...")
     oof_preds, gru_test_res = train_gru_5fold(
         log,
         train_data, blend_train, true_xyz,
         ct_results_train, disp_scale_train,
         test_data,  blend_test,  ct_results_test,  disp_scale_test,
-        N_AUG=9, n_epochs=100, batch_size=512,
+        N_AUG=19, n_epochs=100, batch_size=512,
     )
-    log.info(f"\n[v27-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+    log.info(f"\n[v28-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
     # ── 5. 메타 게이팅 (XGBClassifier on physics features) ──────────────────
@@ -1046,7 +1046,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_gru_v27.csv"
+    out_sub = out_dir / "submission_gru_v28.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)

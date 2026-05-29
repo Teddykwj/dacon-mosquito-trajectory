@@ -1,0 +1,63 @@
+mosquito-1  | 14:40:17  ==================================================================
+mosquito-1  | 14:40:17  모기 비행 궤적 예측 v28 (GRU-128 + N_AUG=19 + 게이팅)
+mosquito-1  | 14:40:17  ==================================================================
+mosquito-1  | 14:40:20  Train: 10000개  |  Test: 10000개
+mosquito-1  | 14:40:21  [CV-last]   R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 14:40:21  [CT-blend]  R-Hit=0.5369  MeanDist=1.43cm  (CT weight 평균: 0.416)
+mosquito-1  | 14:40:21  GRU 파라미터 수: 68,867
+mosquito-1  | 14:40:21  5-Fold GRU 학습 시작 (N_AUG=19, ~200K 증강 샘플)...
+mosquito-1  | 14:54:03    [GRU] Fold 1/5  R-Hit=0.6330  loss=0.04970  (n_tr=160,000)
+mosquito-1  | 15:07:39    [GRU] Fold 2/5  R-Hit=0.6215  loss=0.04787  (n_tr=160,000)
+mosquito-1  | 15:21:14    [GRU] Fold 3/5  R-Hit=0.6290  loss=0.04976  (n_tr=160,000)
+mosquito-1  | 15:34:48    [GRU] Fold 4/5  R-Hit=0.6285  loss=0.04937  (n_tr=160,000)
+mosquito-1  | 15:48:12    [GRU] Fold 5/5  R-Hit=0.6200  loss=0.04933  (n_tr=160,000)
+mosquito-1  | 15:48:12  
+mosquito-1  | [v28-OOF]  R-Hit=0.6264  MeanDist=1.20cm
+mosquito-1  | 15:48:12  
+mosquito-1  | 피처 생성 중 (게이트용)...
+mosquito-1  | 15:48:27  피처 수: 383 (게이트 전용)
+mosquito-1  | 15:48:27  
+mosquito-1  | [Gate] 개선=6768개  악화=3232개  개선율=67.7%
+mosquito-1  | 15:48:30  [OOF-Gated] R-Hit=0.6340  (raw OOF=0.6264)
+mosquito-1  | 15:48:30  
+mosquito-1  | OOF 분석 저장 → output/oof_analysis_v28.csv
+mosquito-1  | 15:48:30  
+mosquito-1  | [에러 분포 (cm)]
+mosquito-1  | 15:48:30    p25=0.41  p50=0.77  p75=1.30  p90=2.50  p95=3.88  p99=8.08
+mosquito-1  | 15:48:30    R-Hit@1cm=0.6264  (mean=1.20cm  max=17.01cm)
+mosquito-1  | 15:48:30  
+mosquito-1  | [속력 구간별 R-Hit]  (speed_last 기준 5분위)
+mosquito-1  | 15:48:30    Q1(느림): R-Hit=0.854  mean_err=0.57cm  n=2000
+mosquito-1  | 15:48:30    Q2: R-Hit=0.736  mean_err=0.89cm  n=2000
+mosquito-1  | 15:48:30    Q3: R-Hit=0.635  mean_err=1.16cm  n=2000
+mosquito-1  | 15:48:30    Q4: R-Hit=0.511  mean_err=1.50cm  n=2000
+mosquito-1  | 15:48:30    Q5(빠름): R-Hit=0.397  mean_err=1.87cm  n=2000
+mosquito-1  | 15:48:30  
+mosquito-1  | [곡률 구간별 R-Hit]  (kappa_last 기준 5분위)
+mosquito-1  | 15:48:30    Q1(직진): R-Hit=0.609  mean_err=1.20cm  n=2000
+mosquito-1  | 15:48:30    Q2: R-Hit=0.630  mean_err=1.21cm  n=2000
+mosquito-1  | 15:48:30    Q3: R-Hit=0.671  mean_err=1.10cm  n=2000
+mosquito-1  | 15:48:30    Q4: R-Hit=0.651  mean_err=1.11cm  n=2000
+mosquito-1  | 15:48:30    Q5(급선회): R-Hit=0.571  mean_err=1.35cm  n=2000
+mosquito-1  | 15:48:30  
+mosquito-1  | [CT weight 구간별 R-Hit]  (선회 강도)
+mosquito-1  | 15:48:30    직진(0~0.1): R-Hit=0.788  mean_err=0.79cm  n=255
+mosquito-1  | 15:48:30    약선회(0.1~0.3): R-Hit=0.735  mean_err=0.93cm  n=4457
+mosquito-1  | 15:48:30    중선회(0.3~0.6): R-Hit=0.595  mean_err=1.24cm  n=2976
+mosquito-1  | 15:48:30    강선회(0.6~1.0): R-Hit=0.440  mean_err=1.69cm  n=2312
+mosquito-1  | 15:48:30  
+mosquito-1  | [속력 추세별 R-Hit]
+mosquito-1  | 15:48:30    감속: R-Hit=0.669  mean_err=1.09cm  n=3334
+mosquito-1  | 15:48:30    등속: R-Hit=0.680  mean_err=1.03cm  n=3333
+mosquito-1  | 15:48:30    가속: R-Hit=0.530  mean_err=1.47cm  n=3333
+mosquito-1  | 15:48:30  
+mosquito-1  | [CV-last 대비]
+mosquito-1  | 15:48:30    개선된 샘플: 4354개 (43.5%)  평균 개선량=0.42cm
+mosquito-1  | 15:48:30    악화된 샘플: 2898개 (29.0%)  평균 악화량=0.28cm
+mosquito-1  | 15:48:30  
+mosquito-1  | [최악 200개 샘플 평균 특성]  (error_cm 기준)
+mosquito-1  | 15:48:30    speed_last=0.96  kappa_last=13.4211  ct_weight=0.502
+mosquito-1  | 15:48:30    straightness=0.803  turn_cos_last=0.866
+mosquito-1  | 15:48:30    전체 대비: speed=0.64  kappa=13.4572  ct_w=0.416
+mosquito-1  | 15:48:30  제출 파일 저장 → output/submission_gru_v28.csv
+mosquito-1  | 15:48:30  완료

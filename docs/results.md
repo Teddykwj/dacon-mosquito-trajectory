@@ -29,6 +29,7 @@
 | v25 | 2026-05-26 | v19 복귀 + cv_smooth 피처 추가 | OOF 0.6148 (Gated 0.6378) | **0.6544** | CA 앵커 제거·cv_smooth 6개 피처 유지, OOF↑+0.0014 but Dacon↓-0.0008 vs v19 |
 | v26 | 2026-05-26 | ω 3프레임 안정화 + speed-trend 블렌드 | OOF 0.6160 (Gated 0.6396) | **0.6536** | 강선회 OOF +0.025↑, but Dacon -0.0008↓. OOF↑-Dacon↓ 패턴 7연속 |
 | v27 | 2026-05-26 | Ultra-small GRU (hidden=32, ~5K) + N_AUG=9 | - | **0.634** | hidden=32(5K params) 과소적합, XGB 대비 -0.021↓ |
+| v28 | 2026-05-28 | GRU hidden=128 (~68K) + N_AUG=19 (~200K 샘플) | - | **0.6428** | v27 대비 +0.0088↑, but XGB v19(0.6552) 대비 -0.0124↓ |
 
 ---
 
