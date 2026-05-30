@@ -31,6 +31,87 @@
 | v27 | 2026-05-26 | Ultra-small GRU (hidden=32, ~5K) + N_AUG=9 | - | **0.634** | hidden=32(5K params) 과소적합, XGB 대비 -0.021↓ |
 | v28 | 2026-05-28 | GRU hidden=128 (~68K) + N_AUG=19 (~200K 샘플) | - | **0.6428** | v27 대비 +0.0088↑, but XGB v19(0.6552) 대비 -0.0124↓ |
 | v29 | 2026-05-30 | XGBoost 복귀 + 원호 피팅(Circle Fit) 피처 추가 | OOF 0.6166 (Gated 0.6385) | **0.6508** | CF 앵커 단독 R-Hit=0.0105(불량), 피처로도 효과 미미. v19 대비 -0.0044↓ |
+| v30 | 2026-05-30 | XGBoost + Pseudo-label 재학습 (2-Phase, 고신뢰 40%) | P1 OOF 0.6138 → P2 OOF 0.6206 (Gated 0.6422) | **0.6554** | Pseudo-label로 OOF +0.0068↑, Dacon v19 대비 +0.0002↑ (역대 최고 타이) |
+
+---
+
+## Changelog
+
+### v30
+- `train_group()`: `cf_preds_g/cf_w_g` 파라미터 제거, `extra_X/extra_y` 파라미터 추가, per-fold 테스트 잔차 수집 및 반환
+- `main()`: 2-Phase 구조 도입 — Phase1(기본 학습) → 5-fold std 기반 고신뢰 40% 선택 → Phase2(pseudo-label 포함 재학습)
+- `make_xgb_features()`: CF 파라미터(`cf_pred`, `cf_weight`) 제거, v25 수준으로 복귀 (383 피처)
+- `make_feature_names()`: CF 관련 피처명 제거
+
+### v29
+- `predict_circle_fit()`: PCA 투영 + 2D 최소제곱 원 피팅 함수 추가 (n_pts=6)
+- `make_xgb_features()`: `cf_pred`, `cf_weight` 파라미터 추가, CF 관련 10개 피처 추가 (cf_pred_L×3, cf_vs_cv_L×3, cf_vs_ct_L×3, cf_weight×1 → 393 피처)
+- `make_feature_names()`: CF 피처명 추가
+- `train_group()`: `cf_preds_g`, `cf_w_g` 파라미터 추가, 증강 시 CF 예측 회전 적용
+- `main()`: GRU 제거, XGBoost 복귀, 원호 피팅 앵커 계산 및 피처 통합
+
+### v28
+- `TrajGRU`: hidden 32→128, head `Linear(hidden+7, 64)`→`Linear(hidden+7, 128)` (~68K params)
+- `train_gru_5fold()`: N_AUG 9→19 (~200K 증강 샘플)
+
+### v27
+- `TrajGRU`: GRU(3→32, 1layer) + head Linear(39,64)+Linear(64,3) (~5K params) 신규 추가
+- `train_gru_5fold()`: train_dl_5fold 대체, N_AUG=9, 100 epochs, batch=512
+- `main()`: XGBoost 제거, GRU 학습으로 교체 (게이트는 XGBClassifier 유지)
+
+### v26
+- `predict_ct()`: ω 단일 프레임 → 마지막 3프레임 평균으로 안정화
+- `_speed_trend_inner()`: 접선 가속도 보정 CV 앵커 추가 (trend_w ∈ [0, 0.4])
+- `batch_physics_blend()`: speed-trend inner + CT 2-layer 블렌드로 교체
+- `make_xgb_features()`: kappa_trend 피처 추가
+
+### v25
+- `main()`: CA 앵커 제거 (v24 복귀), cv_smooth 6개 피처 유지
+- CT blend 앵커 복원 (v19 수준)
+
+### v24
+- `predict_ca_kf()`: Kalman CA 앵커 추가
+- `main()`: CV+CT+CA 3-way 블렌드, ca_kf_pred/ca_kf_vs_cv 피처 10개 추가
+
+### v23
+- `TrajTransformer`: MultiheadAttention(d=64, h=4) + FFN 신규 추가 (~110K params)
+- `train_dl_5fold()`: Transformer 5-fold 학습, N_AUG=10, 150 epochs
+- `prepare_dl_inputs()`: vel_seq(10,3) + phys(7) + R(3,3) 입력 준비 함수 추가
+
+### v22
+- TTA: N=8 회전+스케일 증강 평균 적용 (결과적으로 스케일 TTA는 속력 정규화로 무의미)
+
+### v21
+- 데이터 증강에 속력 스케일 s∈[0.5, 2.0] 추가
+
+### v20
+- 다중 CT 앵커(3개) + 각가속도 dω/dt 피처 추가 시도
+
+### v19
+- `XGBClassifier` 메타 게이팅 추가: OOF 개선 여부를 분류 후 소프트 게이트 적용
+- 블렌드 앵커(CT+CV) 대비 XGBoost 도움 여부 예측
+
+### v17
+- 잔차 정규화 타겟: `(true - blend) @ R / disp_scale` (speed×dt 기반 스케일 나누기)
+
+### v15
+- `_random_rotation()`: SO(3) 균일 분포 회전 (QR 분해) 추가
+- `train_group()`: N_AUG=4 3D 회전 증강 도입, 10K→50K 샘플
+
+### v13
+- `train_group()`: 5-Fold KFold OOF 학습 도입, 전체 10K 데이터 활용
+- CT 피처를 `make_xgb_features()` 내부로 이동 (ct_pred_L, ct_vs_cv_L, ct_weight)
+
+### v12
+- `predict_ct()`: 등속 선회율(CT) 물리 모델 추가, CV+CT 적응 블렌드
+
+### v10
+- `make_xgb_features()`: 법선/접선 가속도(a_t, a_n), 다항식 외삽(quad, cubic), 평면 곡률(kappa_xy, kappa_xz) 추가
+- `_local_frame_rotation()`: 로컬 좌표계(자기중심) 변환 추가
+
+### v7
+- `make_xgb_features()`: 피처 94→274개 확장 (저크, Frenet 곡률, 멀티스케일 CV, 경로 직선성 등)
+- `train_group()`: XGBoost 잔차 학습 구조 확립
 
 ---
 
