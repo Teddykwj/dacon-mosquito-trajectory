@@ -32,6 +32,7 @@
 | v28 | 2026-05-28 | GRU hidden=128 (~68K) + N_AUG=19 (~200K 샘플) | - | **0.6428** | v27 대비 +0.0088↑, but XGB v19(0.6552) 대비 -0.0124↓ |
 | v29 | 2026-05-30 | XGBoost 복귀 + 원호 피팅(Circle Fit) 피처 추가 | OOF 0.6166 (Gated 0.6385) | **0.6508** | CF 앵커 단독 R-Hit=0.0105(불량), 피처로도 효과 미미. v19 대비 -0.0044↓ |
 | v30 | 2026-05-30 | XGBoost + Pseudo-label 재학습 (2-Phase, 고신뢰 40%) | P1 OOF 0.6138 → P2 OOF 0.6206 (Gated 0.6422) | **0.6554** | Pseudo-label로 OOF +0.0068↑, Dacon v19 대비 +0.0002↑ (역대 최고 타이) |
+| v31 | 2026-05-30 | Multi-seed(×5) + Pseudo-label 2-Phase | P1 OOF 0.6225 → P2 OOF 0.6241 (Gated 0.6418) | **0.6530** | OOF↑(+0.0035) but Dacon↓(-0.0024). 다시 OOF↑-Dacon↓ 패턴. 게이트 보정 오류 |
 
 ---
 
