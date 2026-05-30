@@ -33,7 +33,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v31_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v32_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -706,7 +706,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v31.csv"
+    save_path = out_dir / "oof_analysis_v32.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -1023,7 +1023,7 @@ def train_gru_5fold(log,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v31 (XGBoost Multi-seed + Pseudo-label + 게이팅)")
+    log.info("모기 비행 궤적 예측 v32 (XGBoost + cv_smooth 앵커 + Pseudo-label + 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -1039,7 +1039,7 @@ def main():
     log.info(f"[CV-last]   R-Hit={r_hit(cv_preds_train, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(cv_preds_train, true_xyz):.2f}cm")
 
-    # ── 2. ω-안정화 CT 블렌드 (v26 predict_ct) ──────────────────────────────
+    # ── 2. CT 결과 (피처용으로만 사용) ──────────────────────────────────────
     ct_results_train = [predict_ct(t) for t in train_data]
     ct_preds_train   = np.array([r[0] for r in ct_results_train])
     ct_w_train       = np.array([r[1] for r in ct_results_train])
@@ -1048,22 +1048,19 @@ def main():
     ct_preds_test    = np.array([r[0] for r in ct_results_test])
     ct_w_test        = np.array([r[1] for r in ct_results_test])
 
-    w_tr        = ct_w_train[:, None]
-    blend_train = (1 - w_tr) * cv_preds_train + w_tr * ct_preds_train
-    w_te        = ct_w_test[:, None]
-    blend_test  = (1 - w_te) * cv_preds_test  + w_te * ct_preds_test
-    log.info(f"[CT-blend]  R-Hit={r_hit(blend_train, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(blend_train, true_xyz):.2f}cm  "
-             f"(CT weight 평균: {ct_w_train.mean():.3f})")
+    log.info(f"[CT (피처용)] weight 평균: {ct_w_train.mean():.3f}")
 
-    # ── 3. Kalman 스무딩 (cv_smooth 피처용) ─────────────────────────────────
+    # ── 3. Kalman 스무딩 → cv_smooth를 앵커로 승격 ──────────────────────────
     log.info("Kalman 스무딩 계산 중...")
     ka_results_train = [predict_ca_kf(t) for t in train_data]
     cv_smooth_train  = np.array([r[2] for r in ka_results_train])
-    log.info(f"[CV-smooth] R-Hit={r_hit(cv_smooth_train, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(cv_smooth_train, true_xyz):.2f}cm")
-    ka_results_test = [predict_ca_kf(t) for t in test_data]
-    cv_smooth_test  = np.array([r[2] for r in ka_results_test])
+    ka_results_test  = [predict_ca_kf(t) for t in test_data]
+    cv_smooth_test   = np.array([r[2] for r in ka_results_test])
+
+    blend_train = cv_smooth_train
+    blend_test  = cv_smooth_test
+    log.info(f"[cv_smooth 앵커] R-Hit={r_hit(blend_train, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(blend_train, true_xyz):.2f}cm")
 
     # ── 4. 속력 기반 정규화 스케일 ──────────────────────────────────────────
     speed_train      = np.array([np.linalg.norm((t[-1] - t[-2]) / DT) for t in train_data])
@@ -1088,43 +1085,29 @@ def main():
     feat_names = make_feature_names()
     log.info(f"피처 수: {X_train.shape[1]}")
 
-    SEEDS = [42, 123, 456, 789, 1234]
     N_PSEUDO = int(0.4 * len(test_data))
 
-    # ── 6. Phase 1: Multi-seed 5-Fold (10K 학습) ────────────────────────────
-    log.info(f"\n=== Phase 1: Multi-seed 기본 학습 (seeds={SEEDS}) ===")
-    oof_1_acc        = np.zeros_like(true_xyz, dtype=float)
-    test_res_1_acc   = np.zeros((len(test_data), 3))
-    all_fold_res_1   = []   # 모든 seed×fold의 테스트 잔차 (신뢰도 계산용)
-
-    for si, seed in enumerate(SEEDS, 1):
-        log.info(f"  [Seed {seed} ({si}/{len(SEEDS)})]")
-        oof_s, test_res_s, _, folds_s = train_group(
-            log, f"P1-s{seed}",
-            train_data, X_train, R_train,
-            blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
-            X_test, R_test, disp_scale_test,
-            feat_names,
-            cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
-            seed=seed, N_AUG=4,
-        )
-        oof_1_acc      += oof_s
-        test_res_1_acc += test_res_s
-        all_fold_res_1.extend(folds_s)
-
-    oof_1        = oof_1_acc / len(SEEDS)
-    test_res_1   = test_res_1_acc / len(SEEDS)
+    # ── 6. Phase 1: 5-Fold XGBoost (10K 학습) ───────────────────────────────
+    log.info("\n=== Phase 1: 기본 5-Fold 학습 ===")
+    oof_1, test_res_1, _, test_folds_1 = train_group(
+        log, "P1",
+        train_data, X_train, R_train,
+        blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
+        X_test, R_test, disp_scale_test,
+        feat_names,
+        cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
+        seed=42, N_AUG=4,
+    )
     test_preds_1 = blend_test + test_res_1
-    log.info(f"\n[v31-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(oof_1, true_xyz):.2f}cm  "
-             f"({len(SEEDS)}seed × 5fold = {len(all_fold_res_1)}개 예측 평균)")
+    log.info(f"\n[v32-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(oof_1, true_xyz):.2f}cm")
 
     # ── 7. Pseudo-label 신뢰도 기반 샘플 선택 ────────────────────────────────
-    fold_preds = np.stack([blend_test + r for r in all_fold_res_1])  # (25, N_test, 3)
-    fold_std   = fold_preds.std(axis=0).sum(axis=1)                  # (N_test,)
+    fold_preds = np.stack([blend_test + r for r in test_folds_1])  # (5, N_test, 3)
+    fold_std   = fold_preds.std(axis=0).sum(axis=1)                # (N_test,)
     conf_idx   = np.argsort(fold_std)[:N_PSEUDO]
     log.info(f"\n[Pseudo] 고신뢰 테스트 샘플: {len(conf_idx)}개 선택  "
-             f"(25-fold std ≤ {fold_std[conf_idx[-1]]*100:.3f}cm)")
+             f"(fold std ≤ {fold_std[conf_idx[-1]]*100:.3f}cm)")
 
     pseudo_pred  = test_preds_1[conf_idx]
     pseudo_blend = blend_test[conf_idx]
@@ -1134,35 +1117,22 @@ def main():
     pseudo_res_g = pseudo_pred - pseudo_blend
     extra_y      = np.einsum('nij,nj->ni', pseudo_R, pseudo_res_g) / pseudo_scale[:, None]
 
-    # ── 8. Phase 2: Multi-seed Pseudo-label 재학습 ──────────────────────────
-    log.info(f"\n=== Phase 2: Multi-seed Pseudo-label 재학습 (seeds={SEEDS}) ===")
-    oof_2_acc      = np.zeros_like(true_xyz, dtype=float)
-    test_res_2_acc = np.zeros((len(test_data), 3))
-    imp_2_acc      = np.zeros(len(feat_names))
-
-    for si, seed in enumerate(SEEDS, 1):
-        log.info(f"  [Seed {seed} ({si}/{len(SEEDS)})]")
-        oof_s, test_res_s, imp_s, _ = train_group(
-            log, f"P2-s{seed}",
-            train_data, X_train, R_train,
-            blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
-            X_test, R_test, disp_scale_test,
-            feat_names,
-            cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
-            extra_X=extra_X, extra_y=extra_y,
-            seed=seed, N_AUG=4,
-        )
-        oof_2_acc      += oof_s
-        test_res_2_acc += test_res_s
-        imp_2_acc      += imp_s
-
-    oof_2      = oof_2_acc / len(SEEDS)
-    test_res_2 = test_res_2_acc / len(SEEDS)
-    imp_2      = imp_2_acc / len(SEEDS)
-    log.info(f"\n[v31-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
+    # ── 8. Phase 2: Pseudo-label 포함 재학습 ────────────────────────────────
+    log.info("\n=== Phase 2: Pseudo-label 포함 재학습 ===")
+    oof_2, test_res_2, imp_2, _ = train_group(
+        log, "P2",
+        train_data, X_train, R_train,
+        blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
+        X_test, R_test, disp_scale_test,
+        feat_names,
+        cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
+        extra_X=extra_X, extra_y=extra_y,
+        seed=42, N_AUG=4,
+    )
+    log.info(f"\n[v32-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_2, true_xyz):.2f}cm")
 
-    # ── 9. 메타 게이팅 (Phase 2 averaged OOF 기준) ──────────────────────────
+    # ── 9. 메타 게이팅 ──────────────────────────────────────────────────────
     oof_err     = np.linalg.norm(oof_2       - true_xyz, axis=1)
     blend_err   = np.linalg.norm(blend_train - true_xyz, axis=1)
     gate_labels = (oof_err < blend_err).astype(int)
@@ -1193,13 +1163,13 @@ def main():
 
     # ── 10. 피처 중요도 ──────────────────────────────────────────────────────
     log.info("\n" + "=" * 66)
-    log.info("Top 50 피처 중요도 (Phase 2 multi-seed 평균)")
+    log.info("Top 50 피처 중요도 (5-fold 평균, Phase 2)")
     log.info("=" * 66)
     imp_df = pd.DataFrame({'feature': feat_names, 'importance': imp_2})
     imp_df = imp_df.sort_values('importance', ascending=False).reset_index(drop=True)
     for i, row in imp_df.head(50).iterrows():
         log.info(f"  {i+1:3d}. {row['feature']:<45s} {row['importance']:.4f}")
-    imp_path = out_dir / "feature_importance_v31.csv"
+    imp_path = out_dir / "feature_importance_v32.csv"
     imp_df.to_csv(imp_path, index=False)
     log.info(f"피처 중요도 저장 → {imp_path}")
 
@@ -1212,7 +1182,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v31.csv"
+    out_sub = out_dir / "submission_xgb_v32.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
