@@ -33,7 +33,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v32_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v33_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -706,7 +706,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v32.csv"
+    save_path = out_dir / "oof_analysis_v33.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -1023,7 +1023,7 @@ def train_gru_5fold(log,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v32 (XGBoost + cv_smooth 앵커 + Pseudo-label + 게이팅)")
+    log.info("모기 비행 궤적 예측 v33 (XGBoost + cv_smooth 앵커 + Pseudo-label + 소프트 회귀 게이트)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -1132,28 +1132,33 @@ def main():
     log.info(f"\n[v32-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_2, true_xyz):.2f}cm")
 
-    # ── 9. 메타 게이팅 ──────────────────────────────────────────────────────
-    oof_err     = np.linalg.norm(oof_2       - true_xyz, axis=1)
-    blend_err   = np.linalg.norm(blend_train - true_xyz, axis=1)
-    gate_labels = (oof_err < blend_err).astype(int)
-    log.info(f"\n[Gate] 개선={gate_labels.sum()}개  "
-             f"악화={(~gate_labels.astype(bool)).sum()}개  "
-             f"개선율={gate_labels.mean()*100:.1f}%")
+    # ── 9. 소프트 회귀 게이트 (최적 α* 학습) ───────────────────────────────
+    xgb_res_train = oof_2 - blend_train                          # (N, 3)
 
-    gate_clf = xgb.XGBClassifier(
+    # 샘플별 최적 혼합 비율: α* = argmin |blend + α·xgb_res - true|²
+    # → 분석적 해: α* = (xgb_res · (true-blend)) / (|xgb_res|² + ε)
+    dot_num    = np.einsum('ni,ni->n', xgb_res_train, true_xyz - blend_train)
+    dot_den    = np.einsum('ni,ni->n', xgb_res_train, xgb_res_train)
+    alpha_star = np.clip(dot_num / (dot_den + 1e-8), 0.0, 1.0)
+
+    log.info(f"\n[α* 분포]  mean={alpha_star.mean():.3f}  std={alpha_star.std():.3f}  "
+             f"α≥0.5: {(alpha_star >= 0.5).mean()*100:.1f}%  "
+             f"α≤0.1: {(alpha_star <= 0.1).mean()*100:.1f}%")
+
+    gate_reg = xgb.XGBRegressor(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.7,
         tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
     )
-    gate_clf.fit(X_train, gate_labels)
+    gate_reg.fit(X_train, alpha_star)
 
-    gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]
-    gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]
+    alpha_test  = np.clip(gate_reg.predict(X_test),  0.0, 1.0)
+    alpha_train = np.clip(gate_reg.predict(X_train), 0.0, 1.0)
 
-    xgb_res_train = oof_2 - blend_train
-    oof_gated     = blend_train + gate_prob_train[:, None] * xgb_res_train
+    oof_gated = blend_train + alpha_train[:, None] * xgb_res_train
     log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
-             f"(raw OOF={r_hit(oof_2, true_xyz):.4f})")
+             f"(raw OOF={r_hit(oof_2, true_xyz):.4f}  "
+             f"α_test mean={alpha_test.mean():.3f})")
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
@@ -1169,12 +1174,12 @@ def main():
     imp_df = imp_df.sort_values('importance', ascending=False).reset_index(drop=True)
     for i, row in imp_df.head(50).iterrows():
         log.info(f"  {i+1:3d}. {row['feature']:<45s} {row['importance']:.4f}")
-    imp_path = out_dir / "feature_importance_v32.csv"
+    imp_path = out_dir / "feature_importance_v33.csv"
     imp_df.to_csv(imp_path, index=False)
     log.info(f"피처 중요도 저장 → {imp_path}")
 
     # ── 11. 최종 예측 ────────────────────────────────────────────────────────
-    final_test = blend_test + gate_prob_test[:, None] * test_res_2
+    final_test = blend_test + alpha_test[:, None] * test_res_2
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -1182,7 +1187,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v32.csv"
+    out_sub = out_dir / "submission_xgb_v33.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
