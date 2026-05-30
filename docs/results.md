@@ -36,6 +36,7 @@
 | v32 | 2026-05-30 | cv_smooth 앵커 승격 + Pseudo-label 2-Phase | P2 OOF 0.6180 (Gated 0.6504) | **0.6658** | 앵커 CT(0.5369)→cv_smooth(0.5812). Gated OOF +0.0082↑↑, Dacon +0.0104↑↑ (역대 최고) |
 | v33 | 2026-05-30 | v32 + 소프트 회귀 게이트 (α* 최적 혼합) | P2 OOF 0.6180 (Gated 0.6497) | **0.6648** | α* mean=0.61, std=0.42 → 사실상 이진 분포. R-Hit 스텝 지표에서 이진 게이트가 우세 |
 | v34 | 2026-05-30 | v32 + Phase 3 (gated pseudo-label) | P2 OOF 0.6180 → P3 OOF 0.6169 (Gated 0.6508) | **0.6658** | Phase 3 OOF 소폭 하락(-0.0011), Gated 미세 상승(+0.0004). Pseudo-label 포화 확인 |
+| v35 | 2026-05-31 | XGBoost+LightGBM 앙상블 + Pseudo-label | P2 XGB 0.6152 / LGB 0.6191 → 블렌드 OOF 0.6196 (Gated 0.6528) | **0.6636** | Gated OOF↑(+0.0024) but Dacon↓(-0.0022). LGB 일반화 열세. v32가 여전히 최고 |
 
 ---
 
