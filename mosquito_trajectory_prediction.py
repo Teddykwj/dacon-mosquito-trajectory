@@ -33,7 +33,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v33_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v34_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -706,7 +706,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v33.csv"
+    save_path = out_dir / "oof_analysis_v34.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -1023,7 +1023,7 @@ def train_gru_5fold(log,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v33 (XGBoost + cv_smooth 앵커 + Pseudo-label + 소프트 회귀 게이트)")
+    log.info("모기 비행 궤적 예측 v34 (XGBoost + cv_smooth + 3-Phase Pseudo-label + 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -1099,87 +1099,117 @@ def main():
         seed=42, N_AUG=4,
     )
     test_preds_1 = blend_test + test_res_1
-    log.info(f"\n[v32-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
+    log.info(f"\n[v34-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_1, true_xyz):.2f}cm")
 
-    # ── 7. Pseudo-label 신뢰도 기반 샘플 선택 ────────────────────────────────
-    fold_preds = np.stack([blend_test + r for r in test_folds_1])  # (5, N_test, 3)
-    fold_std   = fold_preds.std(axis=0).sum(axis=1)                # (N_test,)
-    conf_idx   = np.argsort(fold_std)[:N_PSEUDO]
-    log.info(f"\n[Pseudo] 고신뢰 테스트 샘플: {len(conf_idx)}개 선택  "
-             f"(fold std ≤ {fold_std[conf_idx[-1]]*100:.3f}cm)")
+    # ── 7. Pseudo-label 1: Phase 1 raw 예측 기반 ─────────────────────────────
+    def _make_pseudo(fold_res_list, test_preds, label):
+        fp   = np.stack([blend_test + r for r in fold_res_list])   # (K, N_test, 3)
+        fstd = fp.std(axis=0).sum(axis=1)                          # (N_test,)
+        cidx = np.argsort(fstd)[:N_PSEUDO]
+        log.info(f"[Pseudo-{label}] {len(cidx)}개 선택  "
+                 f"(fold std ≤ {fstd[cidx[-1]]*100:.3f}cm)")
+        pp   = test_preds[cidx]
+        pb   = blend_test[cidx]
+        pr   = R_test[cidx]
+        ps   = disp_scale_test[cidx]
+        eX   = X_test[cidx]
+        ey   = np.einsum('nij,nj->ni', pr, pp - pb) / ps[:, None]
+        return eX, ey
 
-    pseudo_pred  = test_preds_1[conf_idx]
-    pseudo_blend = blend_test[conf_idx]
-    pseudo_R     = R_test[conf_idx]
-    pseudo_scale = disp_scale_test[conf_idx]
-    extra_X      = X_test[conf_idx]
-    pseudo_res_g = pseudo_pred - pseudo_blend
-    extra_y      = np.einsum('nij,nj->ni', pseudo_R, pseudo_res_g) / pseudo_scale[:, None]
+    extra_X_1, extra_y_1 = _make_pseudo(test_folds_1, test_preds_1, "P1→P2")
 
-    # ── 8. Phase 2: Pseudo-label 포함 재학습 ────────────────────────────────
-    log.info("\n=== Phase 2: Pseudo-label 포함 재학습 ===")
-    oof_2, test_res_2, imp_2, _ = train_group(
+    # ── 8. Phase 2: Phase 1 pseudo-label 포함 재학습 ────────────────────────
+    log.info("\n=== Phase 2: Phase-1 Pseudo-label 재학습 ===")
+    oof_2, test_res_2, _, test_folds_2 = train_group(
         log, "P2",
         train_data, X_train, R_train,
         blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
         X_test, R_test, disp_scale_test,
         feat_names,
         cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
-        extra_X=extra_X, extra_y=extra_y,
+        extra_X=extra_X_1, extra_y=extra_y_1,
         seed=42, N_AUG=4,
     )
-    log.info(f"\n[v32-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
+    log.info(f"\n[v34-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_2, true_xyz):.2f}cm")
 
-    # ── 9. 소프트 회귀 게이트 (최적 α* 학습) ───────────────────────────────
-    xgb_res_train = oof_2 - blend_train                          # (N, 3)
-
-    # 샘플별 최적 혼합 비율: α* = argmin |blend + α·xgb_res - true|²
-    # → 분석적 해: α* = (xgb_res · (true-blend)) / (|xgb_res|² + ε)
-    dot_num    = np.einsum('ni,ni->n', xgb_res_train, true_xyz - blend_train)
-    dot_den    = np.einsum('ni,ni->n', xgb_res_train, xgb_res_train)
-    alpha_star = np.clip(dot_num / (dot_den + 1e-8), 0.0, 1.0)
-
-    log.info(f"\n[α* 분포]  mean={alpha_star.mean():.3f}  std={alpha_star.std():.3f}  "
-             f"α≥0.5: {(alpha_star >= 0.5).mean()*100:.1f}%  "
-             f"α≤0.1: {(alpha_star <= 0.1).mean()*100:.1f}%")
-
-    gate_reg = xgb.XGBRegressor(
+    # ── 9. Phase 2 게이팅 (Phase 3 pseudo-label용) ──────────────────────────
+    oof_2_err   = np.linalg.norm(oof_2       - true_xyz, axis=1)
+    blend_err   = np.linalg.norm(blend_train - true_xyz, axis=1)
+    gate_labels_2 = (oof_2_err < blend_err).astype(int)
+    gate_clf_2 = xgb.XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.7,
         tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
     )
-    gate_reg.fit(X_train, alpha_star)
+    gate_clf_2.fit(X_train, gate_labels_2)
+    gate_prob_test_2  = gate_clf_2.predict_proba(X_test)[:, 1]
+    gate_prob_train_2 = gate_clf_2.predict_proba(X_train)[:, 1]
+    gated_test_2  = blend_test  + gate_prob_test_2[:, None]  * test_res_2
+    gated_train_2 = blend_train + gate_prob_train_2[:, None] * (oof_2 - blend_train)
+    log.info(f"[Phase2-Gated] R-Hit={r_hit(gated_train_2, true_xyz):.4f}  "
+             f"개선율={gate_labels_2.mean()*100:.1f}%")
 
-    alpha_test  = np.clip(gate_reg.predict(X_test),  0.0, 1.0)
-    alpha_train = np.clip(gate_reg.predict(X_train), 0.0, 1.0)
+    # ── 10. Pseudo-label 2: Phase 2 게이팅 예측 기반 (더 정확한 타겟) ────────
+    extra_X_2, extra_y_2 = _make_pseudo(test_folds_2, gated_test_2, "P2→P3")
 
-    oof_gated = blend_train + alpha_train[:, None] * xgb_res_train
+    # ── 11. Phase 3: Phase 2 gated pseudo-label 재학습 ──────────────────────
+    log.info("\n=== Phase 3: Phase-2 Gated Pseudo-label 재학습 ===")
+    oof_3, test_res_3, imp_3, _ = train_group(
+        log, "P3",
+        train_data, X_train, R_train,
+        blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
+        X_test, R_test, disp_scale_test,
+        feat_names,
+        cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
+        extra_X=extra_X_2, extra_y=extra_y_2,
+        seed=42, N_AUG=4,
+    )
+    log.info(f"\n[v34-Phase3-OOF]  R-Hit={r_hit(oof_3, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(oof_3, true_xyz):.2f}cm")
+
+    # ── 12. 최종 게이팅 (Phase 3 OOF 기준) ──────────────────────────────────
+    oof_3_err     = np.linalg.norm(oof_3       - true_xyz, axis=1)
+    gate_labels_3 = (oof_3_err < blend_err).astype(int)
+    log.info(f"\n[Gate] 개선={gate_labels_3.sum()}개  "
+             f"악화={(~gate_labels_3.astype(bool)).sum()}개  "
+             f"개선율={gate_labels_3.mean()*100:.1f}%")
+
+    gate_clf_3 = xgb.XGBClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.7,
+        tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
+    )
+    gate_clf_3.fit(X_train, gate_labels_3)
+    gate_prob_test_3  = gate_clf_3.predict_proba(X_test)[:, 1]
+    gate_prob_train_3 = gate_clf_3.predict_proba(X_train)[:, 1]
+
+    xgb_res_train_3 = oof_3 - blend_train
+    oof_gated = blend_train + gate_prob_train_3[:, None] * xgb_res_train_3
     log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
-             f"(raw OOF={r_hit(oof_2, true_xyz):.4f}  "
-             f"α_test mean={alpha_test.mean():.3f})")
+             f"(raw OOF={r_hit(oof_3, true_xyz):.4f})")
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    run_error_analysis(log, train_data, true_xyz, oof_2,
+    run_error_analysis(log, train_data, true_xyz, oof_3,
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
-    # ── 10. 피처 중요도 ──────────────────────────────────────────────────────
+    # ── 13. 피처 중요도 (Phase 3) ────────────────────────────────────────────
     log.info("\n" + "=" * 66)
-    log.info("Top 50 피처 중요도 (5-fold 평균, Phase 2)")
+    log.info("Top 50 피처 중요도 (5-fold 평균, Phase 3)")
     log.info("=" * 66)
-    imp_df = pd.DataFrame({'feature': feat_names, 'importance': imp_2})
+    imp_df = pd.DataFrame({'feature': feat_names, 'importance': imp_3})
     imp_df = imp_df.sort_values('importance', ascending=False).reset_index(drop=True)
     for i, row in imp_df.head(50).iterrows():
         log.info(f"  {i+1:3d}. {row['feature']:<45s} {row['importance']:.4f}")
-    imp_path = out_dir / "feature_importance_v33.csv"
+    imp_path = out_dir / "feature_importance_v34.csv"
     imp_df.to_csv(imp_path, index=False)
     log.info(f"피처 중요도 저장 → {imp_path}")
 
-    # ── 11. 최종 예측 ────────────────────────────────────────────────────────
-    final_test = blend_test + alpha_test[:, None] * test_res_2
+    # ── 14. 최종 예측 ────────────────────────────────────────────────────────
+    final_test = blend_test + gate_prob_test_3[:, None] * test_res_3
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -1187,7 +1217,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v33.csv"
+    out_sub = out_dir / "submission_xgb_v34.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
