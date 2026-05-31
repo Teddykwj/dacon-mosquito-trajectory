@@ -36,7 +36,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v35_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v36_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -449,6 +449,44 @@ def make_xgb_features(traj: np.ndarray,
     ct_pred_L          = (ct_pred_global - traj[-1]) @ R.T   # 로컬 변위
     ct_vs_cv_L         = ct_pred_L - cv_L                    # CT - CV 차이
 
+    # ── [NEW v36] cv_smooth 로컬 변위 (불일치도 계산 위해 분리) ──────────────
+    if cv_smooth is not None:
+        cv_smooth_L         = (cv_smooth - traj[-1]) @ R.T
+        cv_smooth_vs_raw_L  = cv_smooth_L - cv_L
+        disagree_smooth_ct  = cv_smooth_L - ct_pred_L
+        disagree_smooth_ca  = cv_smooth_L - ca_pred_L
+    else:
+        cv_smooth_L        = np.zeros(3)
+        cv_smooth_vs_raw_L = np.zeros(3)
+        disagree_smooth_ct = np.zeros(3)
+        disagree_smooth_ca = np.zeros(3)
+    disagree_ct_ca = ct_pred_L - ca_pred_L
+
+    # ── [NEW v36] 절대 위치 ──────────────────────────────────────────────────
+    abs_pos_last  = traj[-1].copy()
+    abs_pos_first = traj[0].copy()
+
+    # ── [NEW v36] 3D 비틀림 (Torsion) ────────────────────────────────────────
+    torsion = np.zeros(10)
+    for _i in range(2, 10):
+        _v   = vels[_i];  _vp  = accs[_i];  _vpp = jerk[_i]
+        _cr  = np.cross(_v, _vp)
+        _csq = float(np.dot(_cr, _cr))
+        if _csq > 1e-12:
+            torsion[_i] = float(np.dot(_cr, _vpp)) / _csq
+    torsion_vals = torsion[2:]   # (8,)
+
+    # ── [NEW v36] ω 변화율 ────────────────────────────────────────────────────
+    d_omega       = np.diff(omega)              # (8,)
+    d_omega_stats = np.array([float(d_omega[-3:].mean()),
+                               float(d_omega.std()),
+                               float(d_omega[-1])])
+
+    # ── [NEW v36] 곡률·속력 변동계수 & 원호 피팅 품질 대리 ──────────────────
+    kappa_cv        = float(kappa[1:].std()   / (kappa[1:].mean()  + 1e-8))
+    speed_cv        = float(speed.std()        / (speed.mean()      + 1e-8))
+    kappa_last3_std = float(kappa[-3:].std())
+
     feats = np.concatenate([
         # ── 기존 시계열 ──────────────────────────────────────────────────────
         vels.flatten(),           # (30)
@@ -534,10 +572,29 @@ def make_xgb_features(traj: np.ndarray,
         [ct_weight],            # (1) 선회 강도 기반 CT 신뢰도
 
         # ── [NEW] CV-smooth 피처 (Kalman 스무딩 속도 기반) ──────────────────────
-        *(((cv_smooth - traj[-1]) @ R.T,                    # cv_smooth_L (3)
-           (cv_smooth - traj[-1]) @ R.T - cv_L,             # cv_smooth_vs_raw_L (3)
-           ) if cv_smooth is not None else
-          (np.zeros(3), np.zeros(3))),
+        cv_smooth_L,              # (3)
+        cv_smooth_vs_raw_L,       # (3)
+
+        # ── [NEW v36] 절대 위치 ──────────────────────────────────────────────
+        abs_pos_last,             # (3) 현재 절대 위치
+        abs_pos_first,            # (3) 초기 절대 위치
+
+        # ── [NEW v36] 3D 비틀림 ──────────────────────────────────────────────
+        torsion_vals,             # (8) 프레임별 비틀림
+        [torsion_vals.mean(), torsion_vals.std(),
+         torsion[-1], torsion[-3:].mean()],  # (4)
+
+        # ── [NEW v36] 예측 불일치도 ──────────────────────────────────────────
+        disagree_smooth_ct,       # (3) cv_smooth vs CT
+        disagree_smooth_ca,       # (3) cv_smooth vs CA
+        disagree_ct_ca,           # (3) CT vs CA
+
+        # ── [NEW v36] 곡률·속력 변동계수 ─────────────────────────────────────
+        [kappa_cv, speed_cv, kappa_last3_std],  # (3)
+
+        # ── [NEW v36] ω 변화율 ────────────────────────────────────────────────
+        d_omega,                  # (8)
+        d_omega_stats,            # (3)
 
     ])
     return feats.astype(np.float32), R
@@ -646,6 +703,26 @@ def make_feature_names() -> list[str]:
     for ax in axes: N.append(f"cv_smooth_{ax}")
     for ax in axes: N.append(f"cv_smooth_vs_raw_{ax}")
 
+    # [NEW v36] 절대 위치
+    for ax in axes: N.append(f"abs_pos_last_{ax}")
+    for ax in axes: N.append(f"abs_pos_first_{ax}")
+
+    # [NEW v36] 3D 비틀림
+    for t in range(2, 10): N.append(f"torsion_t{t}")
+    N += ["torsion_mean", "torsion_std", "torsion_last", "torsion_last3_mean"]
+
+    # [NEW v36] 예측 불일치도
+    for ax in axes: N.append(f"disagree_smooth_ct_{ax}")
+    for ax in axes: N.append(f"disagree_smooth_ca_{ax}")
+    for ax in axes: N.append(f"disagree_ct_ca_{ax}")
+
+    # [NEW v36] 곡률·속력 변동계수
+    N += ["kappa_cv", "speed_cv", "kappa_last3_std"]
+
+    # [NEW v36] ω 변화율
+    for t in range(1, 9): N.append(f"d_omega_t{t}")
+    N += ["d_omega_last3_mean", "d_omega_std", "d_omega_last"]
+
     return N
 
 
@@ -709,7 +786,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v35.csv"
+    save_path = out_dir / "oof_analysis_v36.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -1035,7 +1112,7 @@ def train_gru_5fold(log,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v35 (XGBoost+LightGBM 앙상블 + cv_smooth + Pseudo-label + 게이팅)")
+    log.info("모기 비행 궤적 예측 v36 (XGBoost + cv_smooth + 신규 피처 41개 + Pseudo-label + 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -1099,66 +1176,45 @@ def main():
 
     N_PSEUDO = int(0.4 * len(test_data))
 
-    def _blend(oof_a, res_a, folds_a, oof_b, res_b, folds_b, label_a, label_b):
-        """OOF R-Hit 비율로 두 모델 예측 블렌딩."""
-        ra = r_hit(oof_a, true_xyz)
-        rb = r_hit(oof_b, true_xyz)
-        wa = ra / (ra + rb)
-        wb = 1.0 - wa
-        log.info(f"  [{label_a} OOF={ra:.4f} w={wa:.3f}] + "
-                 f"[{label_b} OOF={rb:.4f} w={wb:.3f}]")
-        oof_bl   = wa * oof_a   + wb * oof_b
-        res_bl   = wa * res_a   + wb * res_b
-        fold_bl  = [wa * fa + wb * fb for fa, fb in zip(folds_a, folds_b)]
-        return oof_bl, res_bl, fold_bl
-
     def _make_pseudo(fold_res_list, test_preds, label):
         fp   = np.stack([blend_test + r for r in fold_res_list])
         fstd = fp.std(axis=0).sum(axis=1)
         cidx = np.argsort(fstd)[:N_PSEUDO]
-        log.info(f"  [Pseudo-{label}] {len(cidx)}개  "
+        log.info(f"[Pseudo-{label}] {len(cidx)}개  "
                  f"(fold std ≤ {fstd[cidx[-1]]*100:.3f}cm)")
         pp = test_preds[cidx];  pb = blend_test[cidx]
         pr = R_test[cidx];      ps = disp_scale_test[cidx]
         ey = np.einsum('nij,nj->ni', pr, pp - pb) / ps[:, None]
         return X_test[cidx], ey
 
-    kw = dict(
-        train_data_g=train_data, X_g=X_train, R_g=R_train,
-        blend_g=blend_train, true_xyz_g=true_xyz,
-        cv_preds_g=cv_preds_train, ct_w_g=ct_w_train, disp_scale_g=disp_scale_train,
-        X_test=X_test, R_test=R_test, disp_scale_test=disp_scale_test,
-        feat_names=feat_names,
+    # ── 6. Phase 1: 5-Fold XGBoost (10K 학습) ───────────────────────────────
+    log.info("\n=== Phase 1: 기본 5-Fold 학습 ===")
+    oof_1, res_1, _, fold_1 = train_group(
+        log, "P1",
+        train_data, X_train, R_train,
+        blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
+        X_test, R_test, disp_scale_test, feat_names,
         cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
         seed=42, N_AUG=4,
     )
-
-    # ── 6. Phase 1: XGBoost + LightGBM (10K 학습) ────────────────────────────
-    log.info("\n=== Phase 1: XGBoost + LightGBM 기본 학습 ===")
-    oof_xgb_1, res_xgb_1, _, fold_xgb_1 = train_group(log, "P1-XGB", model_type='xgb', **kw)
-    oof_lgb_1, res_lgb_1, _, fold_lgb_1 = train_group(log, "P1-LGB", model_type='lgb', **kw)
-    oof_1, res_1, fold_1 = _blend(oof_xgb_1, res_xgb_1, fold_xgb_1,
-                                   oof_lgb_1, res_lgb_1, fold_lgb_1, 'XGB', 'LGB')
-    log.info(f"\n[v35-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
+    log.info(f"\n[v36-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_1, true_xyz):.2f}cm")
 
     extra_X, extra_y = _make_pseudo(fold_1, blend_test + res_1, "P1→P2")
 
-    # ── 7. Phase 2: XGBoost + LightGBM (pseudo-label 포함) ───────────────────
-    log.info("\n=== Phase 2: XGBoost + LightGBM Pseudo-label 재학습 ===")
-    oof_xgb_2, res_xgb_2, imp_xgb_2, _ = train_group(
-        log, "P2-XGB", model_type='xgb', extra_X=extra_X, extra_y=extra_y, **kw)
-    oof_lgb_2, res_lgb_2, imp_lgb_2, _ = train_group(
-        log, "P2-LGB", model_type='lgb', extra_X=extra_X, extra_y=extra_y, **kw)
-    oof_2, res_2, _ = _blend(oof_xgb_2, res_xgb_2, [],
-                              oof_lgb_2, res_lgb_2, [], 'XGB', 'LGB')
-    log.info(f"\n[v35-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
+    # ── 7. Phase 2: Pseudo-label 포함 재학습 ────────────────────────────────
+    log.info("\n=== Phase 2: Pseudo-label 포함 재학습 ===")
+    oof_2, res_2, imp_2, _ = train_group(
+        log, "P2",
+        train_data, X_train, R_train,
+        blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
+        X_test, R_test, disp_scale_test, feat_names,
+        cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
+        extra_X=extra_X, extra_y=extra_y,
+        seed=42, N_AUG=4,
+    )
+    log.info(f"\n[v36-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_2, true_xyz):.2f}cm")
-
-    # imp 블렌딩 (같은 피처 공간)
-    rx = r_hit(oof_xgb_2, true_xyz); rl = r_hit(oof_lgb_2, true_xyz)
-    wx = rx / (rx + rl)
-    imp_2 = wx * imp_xgb_2 + (1 - wx) * imp_lgb_2
 
     # ── 8. 메타 게이팅 ──────────────────────────────────────────────────────
     blend_err   = np.linalg.norm(blend_train - true_xyz, axis=1)
@@ -1177,8 +1233,8 @@ def main():
     gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]
     gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]
 
-    model_res_train = oof_2 - blend_train
-    oof_gated = blend_train + gate_prob_train[:, None] * model_res_train
+    xgb_res_train = oof_2 - blend_train
+    oof_gated = blend_train + gate_prob_train[:, None] * xgb_res_train
     log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
              f"(raw OOF={r_hit(oof_2, true_xyz):.4f})")
 
@@ -1190,13 +1246,13 @@ def main():
 
     # ── 9. 피처 중요도 ───────────────────────────────────────────────────────
     log.info("\n" + "=" * 66)
-    log.info("Top 50 피처 중요도 (Phase 2 XGB+LGB 블렌드)")
+    log.info("Top 50 피처 중요도 (5-fold 평균, Phase 2)")
     log.info("=" * 66)
     imp_df = pd.DataFrame({'feature': feat_names, 'importance': imp_2})
     imp_df = imp_df.sort_values('importance', ascending=False).reset_index(drop=True)
     for i, row in imp_df.head(50).iterrows():
         log.info(f"  {i+1:3d}. {row['feature']:<45s} {row['importance']:.4f}")
-    imp_path = out_dir / "feature_importance_v35.csv"
+    imp_path = out_dir / "feature_importance_v36.csv"
     imp_df.to_csv(imp_path, index=False)
     log.info(f"피처 중요도 저장 → {imp_path}")
 
@@ -1209,7 +1265,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v35.csv"
+    out_sub = out_dir / "submission_xgb_v36.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
