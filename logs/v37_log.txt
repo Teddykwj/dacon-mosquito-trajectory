@@ -1,0 +1,107 @@
+docker compose up --build
+w Enable Watch   d Detach
+[+] Building 3.0s (15/15) FINISHED                        
+ => [internal] load local bake definitions           0.0s
+ => => reading from stdin 488B                       0.0s
+ => [internal] load build definition from dockerfil  0.0s
+ => => transferring dockerfile: 484B                 0.0s
+ => [internal] load metadata for docker.io/library/  0.0s
+ => [internal] load .dockerignore                    0.0s
+ => => transferring context: 2B                      0.0s
+ => [1/8] FROM docker.io/library/python:3.11-slim    0.0s
+ => [internal] load build context                    0.4s
+ => => transferring context: 972.15kB                0.3s
+ => CACHED [2/8] RUN apt-get update && apt-get inst  0.0s
+ => CACHED [3/8] WORKDIR /app                        0.0s
+ => CACHED [4/8] COPY requirements.txt .             0.0s
+ => CACHED [5/8] RUN pip install --no-cache-dir -r   0.0s
+ => CACHED [6/8] RUN pip install --no-cache-dir tor  0.0s
+ => [7/8] COPY . .                                   1.0s
+ => [8/8] RUN mkdir -p /app/logs /app/output && chm  0.2s
+ => exporting to image                               1.2s
+ => => exporting layers                              1.2s
+ => => writing image sha256:6a90621a224d42706151501  0.0s
+ => => naming to docker.io/library/test-mosquito     0.0s
+ => resolving provenance for metadata file           0.0s
+[+] up 2/2
+ ✔ Image test-mosquito       Built                   3.0s 
+ ✔ Container test-mosquito-1 Recreated               0.1s 
+Attaching to mosquito-1
+mosquito-1  | 13:16:19  ==================================================================
+mosquito-1  | 13:16:19  모기 비행 궤적 예측 v37 (MLP + smooth R-Hit loss + cv_smooth + Pseudo-label + XGB 게이팅)
+mosquito-1  | 13:16:19  ==================================================================
+mosquito-1  | 13:16:27  Train: 10000개  |  Test: 10000개
+mosquito-1  | 13:16:27  [CV-last]   R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 13:16:28  [CT (피처용)] weight 평균: 0.416
+mosquito-1  | 13:16:28  Kalman 스무딩 계산 중...
+mosquito-1  | 13:16:30  [cv_smooth 앵커] R-Hit=0.5812  MeanDist=1.36cm
+mosquito-1  | 13:16:30  피처 생성 중...
+mosquito-1  | 13:16:44  피처 수: 424
+mosquito-1  | 13:16:44  
+mosquito-1  | === Phase 1: MLP 기본 학습 ===
+mosquito-1  | 13:16:44    MLP device: cpu  hidden=512  epochs=100
+mosquito-1  | 13:19:00    [P1] Fold 1/5  R-Hit=0.6625  (best=0.6620  n_tr=40,000+0pseudo)
+mosquito-1  | 13:20:48    [P1] Fold 2/5  R-Hit=0.6635  (best=0.6630  n_tr=40,000+0pseudo)
+mosquito-1  | 13:22:37    [P1] Fold 3/5  R-Hit=0.6700  (best=0.6725  n_tr=40,000+0pseudo)
+mosquito-1  | 13:24:26    [P1] Fold 4/5  R-Hit=0.6580  (best=0.6585  n_tr=40,000+0pseudo)
+mosquito-1  | 13:26:16    [P1] Fold 5/5  R-Hit=0.6530  (best=0.6540  n_tr=40,000+0pseudo)
+mosquito-1  | 13:26:16  
+mosquito-1  | [v37-Phase1-OOF]  R-Hit=0.6614  MeanDist=1.19cm
+mosquito-1  | 13:26:16  [Pseudo-P1→P2] 4000개  (fold std ≤ 0.127cm)
+mosquito-1  | 13:26:16  
+mosquito-1  | === Phase 2: Pseudo-label 포함 MLP 재학습 ===
+mosquito-1  | 13:26:16    MLP device: cpu  hidden=512  epochs=100
+mosquito-1  | 13:28:44    [P2] Fold 1/5  R-Hit=0.6640  (best=0.6640  n_tr=40,000+4000pseudo)
+mosquito-1  | 13:30:44    [P2] Fold 2/5  R-Hit=0.6635  (best=0.6635  n_tr=40,000+4000pseudo)
+mosquito-1  | 13:32:45    [P2] Fold 3/5  R-Hit=0.6685  (best=0.6695  n_tr=40,000+4000pseudo)
+mosquito-1  | 13:34:45    [P2] Fold 4/5  R-Hit=0.6530  (best=0.6540  n_tr=40,000+4000pseudo)
+mosquito-1  | 13:36:45    [P2] Fold 5/5  R-Hit=0.6565  (best=0.6565  n_tr=40,000+4000pseudo)
+mosquito-1  | 13:36:45  
+mosquito-1  | [v37-Phase2-OOF]  R-Hit=0.6611  MeanDist=1.20cm
+mosquito-1  | 13:36:45  
+mosquito-1  | [Gate] 개선=6376개  악화=3624개  개선율=63.8%
+mosquito-1  | 13:36:48  [OOF-Gated] R-Hit=0.6643  (raw OOF=0.6611)
+mosquito-1  | 13:36:48  
+mosquito-1  | OOF 분석 저장 → output/oof_analysis_v37.csv
+mosquito-1  | 13:36:48  
+mosquito-1  | [에러 분포 (cm)]
+mosquito-1  | 13:36:48    p25=0.38  p50=0.71  p75=1.24  p90=2.55  p95=4.30  p99=9.06
+mosquito-1  | 13:36:48    R-Hit@1cm=0.6611  (mean=1.20cm  max=17.78cm)
+mosquito-1  | 13:36:48  
+mosquito-1  | [속력 구간별 R-Hit]  (speed_last 기준 5분위)
+mosquito-1  | 13:36:48    Q1(느림): R-Hit=0.861  mean_err=0.56cm  n=2000
+mosquito-1  | 13:36:48    Q2: R-Hit=0.763  mean_err=0.89cm  n=2000
+mosquito-1  | 13:36:48    Q3: R-Hit=0.667  mean_err=1.17cm  n=2000
+mosquito-1  | 13:36:48    Q4: R-Hit=0.549  mean_err=1.51cm  n=2000
+mosquito-1  | 13:36:48    Q5(빠름): R-Hit=0.465  mean_err=1.86cm  n=2000
+mosquito-1  | 13:36:48  
+mosquito-1  | [곡률 구간별 R-Hit]  (kappa_last 기준 5분위)
+mosquito-1  | 13:36:48    Q1(직진): R-Hit=0.654  mean_err=1.17cm  n=2000
+mosquito-1  | 13:36:48    Q2: R-Hit=0.677  mean_err=1.18cm  n=2000
+mosquito-1  | 13:36:48    Q3: R-Hit=0.705  mean_err=1.09cm  n=2000
+mosquito-1  | 13:36:48    Q4: R-Hit=0.680  mean_err=1.13cm  n=2000
+mosquito-1  | 13:36:48    Q5(급선회): R-Hit=0.589  mean_err=1.42cm  n=2000
+mosquito-1  | 13:36:48  
+mosquito-1  | [CT weight 구간별 R-Hit]  (선회 강도)
+mosquito-1  | 13:36:48    직진(0~0.1): R-Hit=0.800  mean_err=0.79cm  n=255
+mosquito-1  | 13:36:48    약선회(0.1~0.3): R-Hit=0.757  mean_err=0.92cm  n=4457
+mosquito-1  | 13:36:48    중선회(0.3~0.6): R-Hit=0.639  mean_err=1.24cm  n=2976
+mosquito-1  | 13:36:48    강선회(0.6~1.0): R-Hit=0.490  mean_err=1.73cm  n=2312
+mosquito-1  | 13:36:48  
+mosquito-1  | [속력 추세별 R-Hit]
+mosquito-1  | 13:36:48    감속: R-Hit=0.694  mean_err=1.11cm  n=3334
+mosquito-1  | 13:36:48    등속: R-Hit=0.703  mean_err=1.03cm  n=3333
+mosquito-1  | 13:36:48    가속: R-Hit=0.587  mean_err=1.45cm  n=3333
+mosquito-1  | 13:36:48  
+mosquito-1  | [CV-last 대비]
+mosquito-1  | 13:36:48    개선된 샘플: 4962개 (49.6%)  평 균 개선량=0.35cm
+mosquito-1  | 13:36:48    악화된 샘플: 3003개 (30.0%)  평 균 악화량=0.27cm
+mosquito-1  | 13:36:48  
+mosquito-1  | [최악 200개 샘플 평균 특성]  (error_cm 기준)
+mosquito-1  | 13:36:48    speed_last=0.95  kappa_last=10.5754  ct_weight=0.524
+mosquito-1  | 13:36:48    straightness=0.772  turn_cos_last=0.871
+mosquito-1  | 13:36:48    전체 대비: speed=0.64  kappa=13.4572  ct_w=0.416
+mosquito-1  | 13:36:48  [최종 예측] 좌표 범위 검증 완료  (blend 기준 ±10cm 이내)
+mosquito-1  | 13:36:48  제출 파일 저장 → output/submission_mlp_v37.csv
+mosquito-1  | 13:36:48  완료
+mosquito-1 exited with code 0

@@ -36,7 +36,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v36_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v37_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -786,7 +786,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v36.csv"
+    save_path = out_dir / "oof_analysis_v37.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -1108,11 +1108,186 @@ def train_gru_5fold(log,
     return oof_preds, dl_test_res
 
 
+# ── Smooth R-Hit Loss ─────────────────────────────────────────────────────────
+def smooth_rhit_loss(pred_norm: torch.Tensor,
+                     true_norm: torch.Tensor,
+                     disp_scale: torch.Tensor,
+                     k: float = 10.0) -> torch.Tensor:
+    """Smooth R-Hit@1cm 손실.
+    pred/true_norm: (N, 3) 정규화된 로컬 잔차
+    disp_scale: (N,) = speed * dt (미터)
+    """
+    diff_cm = torch.norm((pred_norm - true_norm) * disp_scale.unsqueeze(1), dim=1) * 100.0
+    return -torch.sigmoid(k * (1.0 - diff_cm)).mean()
+
+
+# ── MLP 모델 (tabular features → 잔차 예측) ──────────────────────────────────
+class TrajMLP(nn.Module):
+    def __init__(self, n_feat: int, hidden: int = 512, dropout: float = 0.3):
+        super().__init__()
+        self.input_bn = nn.BatchNorm1d(n_feat)
+        self.fc1  = nn.Linear(n_feat, hidden)
+        self.bn1  = nn.BatchNorm1d(hidden)
+        self.fc2  = nn.Linear(hidden, hidden)
+        self.bn2  = nn.BatchNorm1d(hidden)
+        self.fc3  = nn.Linear(hidden, 256)
+        self.bn3  = nn.BatchNorm1d(256)
+        self.head = nn.Linear(256, 3)
+        self.drop = nn.Dropout(dropout)
+        self.act  = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x  = self.input_bn(x)
+        h1 = self.drop(self.act(self.bn1(self.fc1(x))))
+        h2 = self.drop(self.act(self.bn2(self.fc2(h1)))) + h1  # residual
+        h3 = self.drop(self.act(self.bn3(self.fc3(h2))))
+        return self.head(h3)
+
+
+# ── MLP 5-Fold 학습 ───────────────────────────────────────────────────────────
+def train_mlp_5fold(log, label,
+                    train_data, X_g, R_g,
+                    blend_g, true_xyz_g, cv_preds_g, ct_w_g, disp_scale_g,
+                    X_test, R_test, disp_scale_test,
+                    cv_smooth_g=None,
+                    extra_X=None, extra_y=None, extra_scale=None,
+                    seed=42, N_AUG=4, n_folds=5,
+                    n_epochs=100, batch_size=2048,
+                    hidden=512, dropout=0.3,
+                    k_rhit=10.0, lr=1e-3, weight_decay=1e-4):
+    """5-Fold MLP + smooth R-Hit loss + 3D 회전 증강."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    log.info(f"  MLP device: {device}  hidden={hidden}  epochs={n_epochs}")
+    n  = len(train_data)
+    nt = len(X_test)
+    rng = np.random.RandomState(42)
+
+    # ── 증강 데이터 생성 ─────────────────────────────────────────────────────
+    all_X = [X_g]; all_R = [R_g]
+    all_blend = [blend_g]; all_true = [true_xyz_g]
+    all_scale = [disp_scale_g]
+
+    for _ in range(N_AUG):
+        Q_batch   = np.array([_random_rotation(rng) for _ in range(n)])
+        trajs_rot = [(Q_batch[i] @ train_data[i].T).T for i in range(n)]
+        true_rot  = np.einsum('nij,nj->ni', Q_batch, true_xyz_g)
+        blend_rot = np.einsum('nij,nj->ni', Q_batch, blend_g)
+        cv_rot    = np.einsum('nij,nj->ni', Q_batch, cv_preds_g)
+        cv_sm_rot = (np.einsum('nij,nj->ni', Q_batch, cv_smooth_g)
+                     if cv_smooth_g is not None else [None] * n)
+        aug_out   = [make_xgb_features(t, cv, cw, cvs)
+                     for t, cv, cw, cvs in zip(trajs_rot, cv_rot, ct_w_g, cv_sm_rot)]
+        all_X.append(np.array([o[0] for o in aug_out]))
+        all_R.append(np.array([o[1] for o in aug_out]))
+        all_blend.append(blend_rot)
+        all_true.append(true_rot)
+        all_scale.append(disp_scale_g)
+
+    X_all          = np.concatenate(all_X,     axis=0)
+    R_all          = np.concatenate(all_R,     axis=0)
+    blend_all_aug  = np.concatenate(all_blend, axis=0)
+    true_all       = np.concatenate(all_true,  axis=0)
+    disp_scale_all = np.concatenate(all_scale, axis=0)
+    res_loc_norm   = (np.einsum('nij,nj->ni', R_all, true_all - blend_all_aug)
+                      / disp_scale_all[:, None]).astype(np.float32)
+
+    n_feat           = X_all.shape[1]
+    kf               = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    oof              = np.zeros_like(true_xyz_g)
+    test_res_acc     = np.zeros((nt, 3))
+    test_res_per_fold = []
+
+    X_test_t = torch.from_numpy(X_test.astype(np.float32)).to(device)
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(range(n)), 1):
+        tr_aug_idx = np.concatenate([tr_idx + n * r for r in range(N_AUG + 1)])
+
+        X_tr  = X_all[tr_aug_idx].astype(np.float32)
+        y_tr  = res_loc_norm[tr_aug_idx]
+        s_tr  = disp_scale_all[tr_aug_idx].astype(np.float32)
+
+        if extra_X is not None and len(extra_X) > 0:
+            X_tr = np.vstack([X_tr, extra_X.astype(np.float32)])
+            y_tr = np.vstack([y_tr, extra_y.astype(np.float32)])
+            es   = (extra_scale if extra_scale is not None
+                    else np.full(len(extra_X), float(disp_scale_g.mean())))
+            s_tr = np.concatenate([s_tr, es.astype(np.float32)])
+
+        X_val = X_all[val_idx].astype(np.float32)
+        y_val = res_loc_norm[val_idx]
+        s_val = disp_scale_all[val_idx].astype(np.float32)
+        R_val = R_all[val_idx]
+
+        X_tr_t = torch.from_numpy(X_tr).to(device)
+        y_tr_t = torch.from_numpy(y_tr).to(device)
+        s_tr_t = torch.from_numpy(s_tr).to(device)
+        X_val_t = torch.from_numpy(X_val).to(device)
+
+        torch.manual_seed(seed + fold)
+        model = TrajMLP(n_feat, hidden=hidden, dropout=dropout).to(device)
+        opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+
+        N_tr       = len(X_tr_t)
+        best_rhit  = 0.0
+        best_state = None
+
+        for epoch in range(n_epochs):
+            model.train()
+            perm = torch.randperm(N_tr, device=device)
+            for i in range(0, N_tr, batch_size):
+                b    = perm[i:i+batch_size]
+                pred = model(X_tr_t[b])
+                loss = smooth_rhit_loss(pred, y_tr_t[b], s_tr_t[b], k=k_rhit)
+                opt.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+            sched.step()
+
+            if (epoch + 1) % 20 == 0 or epoch == n_epochs - 1:
+                model.eval()
+                with torch.no_grad():
+                    vp = model(X_val_t).cpu().numpy()
+                vr = np.einsum('nji,nj->ni', R_val, vp * s_val[:, None])
+                vpos = blend_all_aug[val_idx] + vr
+                vh   = float(np.mean(np.linalg.norm(vpos - true_xyz_g[val_idx], axis=1) < 0.01))
+                if vh > best_rhit:
+                    best_rhit  = vh
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if best_state:
+            model.load_state_dict(best_state)
+        model.eval()
+        with torch.no_grad():
+            val_pn  = model(X_val_t).cpu().numpy()
+            test_pn = model(X_test_t).cpu().numpy()
+
+        # 극단값 클리핑: 정규화 잔차 ±0.5 (disp_scale × 0.5 ≈ 최대 2cm 보정)
+        val_pn  = np.clip(np.nan_to_num(val_pn,  0.0), -0.5, 0.5)
+        test_pn = np.clip(np.nan_to_num(test_pn, 0.0), -0.5, 0.5)
+
+        vr_loc = val_pn * s_val[:, None]
+        vr_glo = np.einsum('nji,nj->ni', R_val, vr_loc)
+        oof[val_idx] = blend_all_aug[val_idx] + vr_glo
+
+        n_pseudo = len(extra_X) if extra_X is not None else 0
+        log.info(f"  [{label}] Fold {fold}/{n_folds}  "
+                 f"R-Hit={r_hit(oof[val_idx], true_xyz_g[val_idx]):.4f}  "
+                 f"(best={best_rhit:.4f}  n_tr={len(tr_aug_idx):,}+{n_pseudo}pseudo)")
+
+        tr_loc = test_pn * disp_scale_test[:, None].astype(np.float32)
+        tr_glo = np.einsum('nji,nj->ni', R_test, tr_loc)
+        test_res_per_fold.append(tr_glo)
+        test_res_acc += tr_glo
+
+    return oof, test_res_acc / n_folds, test_res_per_fold
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v36 (XGBoost + cv_smooth + 신규 피처 41개 + Pseudo-label + 게이팅)")
+    log.info("모기 비행 궤적 예측 v37 (MLP + smooth R-Hit loss + cv_smooth + Pseudo-label + XGB 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -1185,38 +1360,37 @@ def main():
         pp = test_preds[cidx];  pb = blend_test[cidx]
         pr = R_test[cidx];      ps = disp_scale_test[cidx]
         ey = np.einsum('nij,nj->ni', pr, pp - pb) / ps[:, None]
-        return X_test[cidx], ey
+        return X_test[cidx], ey, ps
 
-    # ── 6. Phase 1: 5-Fold XGBoost (10K 학습) ───────────────────────────────
-    log.info("\n=== Phase 1: 기본 5-Fold 학습 ===")
-    oof_1, res_1, _, fold_1 = train_group(
-        log, "P1",
-        train_data, X_train, R_train,
-        blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
-        X_test, R_test, disp_scale_test, feat_names,
-        cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
-        seed=42, N_AUG=4,
+    mlp_kw = dict(
+        train_data=train_data, X_g=X_train, R_g=R_train,
+        blend_g=blend_train, true_xyz_g=true_xyz,
+        cv_preds_g=cv_preds_train, ct_w_g=ct_w_train, disp_scale_g=disp_scale_train,
+        X_test=X_test, R_test=R_test, disp_scale_test=disp_scale_test,
+        cv_smooth_g=cv_smooth_train,
+        seed=42, N_AUG=4, n_epochs=100, batch_size=2048,
+        hidden=512, dropout=0.3, k_rhit=10.0, lr=1e-3,
     )
-    log.info(f"\n[v36-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
+
+    # ── 6. Phase 1: MLP 5-Fold (10K 학습) ───────────────────────────────────
+    log.info("\n=== Phase 1: MLP 기본 학습 ===")
+    oof_1, res_1, fold_1 = train_mlp_5fold(log, "P1", **mlp_kw)
+    log.info(f"\n[v37-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_1, true_xyz):.2f}cm")
 
-    extra_X, extra_y = _make_pseudo(fold_1, blend_test + res_1, "P1→P2")
+    extra_X, extra_y, extra_s = _make_pseudo(fold_1, blend_test + res_1, "P1→P2")
 
-    # ── 7. Phase 2: Pseudo-label 포함 재학습 ────────────────────────────────
-    log.info("\n=== Phase 2: Pseudo-label 포함 재학습 ===")
-    oof_2, res_2, imp_2, _ = train_group(
+    # ── 7. Phase 2: Pseudo-label 포함 MLP 재학습 ────────────────────────────
+    log.info("\n=== Phase 2: Pseudo-label 포함 MLP 재학습 ===")
+    oof_2, res_2, _ = train_mlp_5fold(
         log, "P2",
-        train_data, X_train, R_train,
-        blend_train, true_xyz, cv_preds_train, ct_w_train, disp_scale_train,
-        X_test, R_test, disp_scale_test, feat_names,
-        cv_smooth_g=cv_smooth_train, cv_smooth_test=cv_smooth_test,
-        extra_X=extra_X, extra_y=extra_y,
-        seed=42, N_AUG=4,
+        extra_X=extra_X, extra_y=extra_y, extra_scale=extra_s,
+        **mlp_kw,
     )
-    log.info(f"\n[v36-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
+    log.info(f"\n[v37-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_2, true_xyz):.2f}cm")
 
-    # ── 8. 메타 게이팅 ──────────────────────────────────────────────────────
+    # ── 8. XGBoost 메타 게이팅 ──────────────────────────────────────────────
     blend_err   = np.linalg.norm(blend_train - true_xyz, axis=1)
     oof_err     = np.linalg.norm(oof_2       - true_xyz, axis=1)
     gate_labels = (oof_err < blend_err).astype(int)
@@ -1233,8 +1407,8 @@ def main():
     gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]
     gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]
 
-    xgb_res_train = oof_2 - blend_train
-    oof_gated = blend_train + gate_prob_train[:, None] * xgb_res_train
+    mlp_res_train = oof_2 - blend_train
+    oof_gated = blend_train + gate_prob_train[:, None] * mlp_res_train
     log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
              f"(raw OOF={r_hit(oof_2, true_xyz):.4f})")
 
@@ -1244,20 +1418,22 @@ def main():
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
-    # ── 9. 피처 중요도 ───────────────────────────────────────────────────────
-    log.info("\n" + "=" * 66)
-    log.info("Top 50 피처 중요도 (5-fold 평균, Phase 2)")
-    log.info("=" * 66)
-    imp_df = pd.DataFrame({'feature': feat_names, 'importance': imp_2})
-    imp_df = imp_df.sort_values('importance', ascending=False).reset_index(drop=True)
-    for i, row in imp_df.head(50).iterrows():
-        log.info(f"  {i+1:3d}. {row['feature']:<45s} {row['importance']:.4f}")
-    imp_path = out_dir / "feature_importance_v36.csv"
-    imp_df.to_csv(imp_path, index=False)
-    log.info(f"피처 중요도 저장 → {imp_path}")
-
-    # ── 10. 최종 예측 ────────────────────────────────────────────────────────
+    # ── 9. 최종 예측 ─────────────────────────────────────────────────────────
     final_test = blend_test + gate_prob_test[:, None] * res_2
+
+    # NaN/Inf 체크 → blend로 폴백
+    bad_mask = ~np.isfinite(final_test).all(axis=1)
+    if bad_mask.any():
+        log.info(f"  경고: {bad_mask.sum()}개 샘플 NaN/Inf → blend_test로 대체")
+        final_test[bad_mask] = blend_test[bad_mask]
+
+    # 좌표 범위 검증: blend_test 기준 ±10cm 이내로 클리핑
+    MAX_CORR = 0.10
+    final_test = np.clip(final_test,
+                         blend_test - MAX_CORR,
+                         blend_test + MAX_CORR).astype(np.float64)
+    log.info(f"[최종 예측] 좌표 범위 검증 완료  "
+             f"(blend 기준 ±{MAX_CORR*100:.0f}cm 이내)")
 
     sub      = pd.read_csv(SAMPLE_SUB)
     pred_map = {tid: pred for tid, pred in zip(test_ids, final_test)}
@@ -1265,7 +1441,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_xgb_v36.csv"
+    out_sub = out_dir / "submission_mlp_v37.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)

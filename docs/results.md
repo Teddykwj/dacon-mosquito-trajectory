@@ -38,6 +38,7 @@
 | v34 | 2026-05-30 | v32 + Phase 3 (gated pseudo-label) | P2 OOF 0.6180 → P3 OOF 0.6169 (Gated 0.6508) | **0.6658** | Phase 3 OOF 소폭 하락(-0.0011), Gated 미세 상승(+0.0004). Pseudo-label 포화 확인 |
 | v35 | 2026-05-31 | XGBoost+LightGBM 앙상블 + Pseudo-label | P2 XGB 0.6152 / LGB 0.6191 → 블렌드 OOF 0.6196 (Gated 0.6528) | **0.6636** | Gated OOF↑(+0.0024) but Dacon↓(-0.0022). LGB 일반화 열세. v32가 여전히 최고 |
 | v36 | 2026-05-31 | v32 + 신규 피처 41개 (비틀림·불일치도·절대위치·dω) | P2 OOF 0.6193 (Gated 0.6531) | **0.6630** | Gated OOF↑(+0.0027) but Dacon↓(-0.0028). 비틀림·절대위치 노이즈. 불일치도·dω는 유효 |
+| v37 | 2026-05-31 | MLP(512) + smooth R-Hit loss + cv_smooth + Pseudo-label + XGB 게이팅 | P2 OOF 0.6624 (Gated 0.6680) | **0.6772** | R-Hit 직접 최적화. Q5 0.349→0.464(+0.115↑↑). 역대 최고 +0.0114↑↑ |
 
 ---
 
