@@ -8,7 +8,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# GB10 Blackwell(sm_121) 지원: CUDA 12.8 이상 빌드 필요
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
 
 COPY . .
 

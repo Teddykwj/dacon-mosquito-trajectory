@@ -36,7 +36,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v37_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v38_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -786,7 +786,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v37.csv"
+    save_path = out_dir / "oof_analysis_v38.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -927,10 +927,11 @@ def train_group(log, label,
                 random_state=seed, n_jobs=-1, verbosity=-1,
             )
         else:
+            _xgb_device = 'cuda' if torch.cuda.is_available() else 'cpu'
             base = xgb.XGBRegressor(
                 n_estimators=500, max_depth=6, learning_rate=0.05,
                 subsample=0.8, colsample_bytree=0.7, min_child_weight=3,
-                tree_method='hist', random_state=seed, n_jobs=-1, verbosity=0,
+                tree_method='hist', device=_xgb_device, random_state=seed, n_jobs=-1, verbosity=0,
             )
         model = MultiOutputRegressor(base, n_jobs=1)
         model.fit(X_fold, y_fold)
@@ -1287,7 +1288,7 @@ def train_mlp_5fold(log, label,
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v37 (MLP + smooth R-Hit loss + cv_smooth + Pseudo-label + XGB 게이팅)")
+    log.info("모기 비행 궤적 예측 v38 (MLP 3-seed 앙상블 + N_AUG=9 + smooth R-Hit + XGB 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -1351,75 +1352,65 @@ def main():
 
     N_PSEUDO = int(0.4 * len(test_data))
 
-    def _make_pseudo(fold_res_list, test_preds, label):
-        fp   = np.stack([blend_test + r for r in fold_res_list])
-        fstd = fp.std(axis=0).sum(axis=1)
-        cidx = np.argsort(fstd)[:N_PSEUDO]
-        log.info(f"[Pseudo-{label}] {len(cidx)}개  "
-                 f"(fold std ≤ {fstd[cidx[-1]]*100:.3f}cm)")
-        pp = test_preds[cidx];  pb = blend_test[cidx]
-        pr = R_test[cidx];      ps = disp_scale_test[cidx]
-        ey = np.einsum('nij,nj->ni', pr, pp - pb) / ps[:, None]
-        return X_test[cidx], ey, ps
-
-    mlp_kw = dict(
+    SEEDS   = [42, 123, 456]
+    MLP_KW  = dict(
         train_data=train_data, X_g=X_train, R_g=R_train,
         blend_g=blend_train, true_xyz_g=true_xyz,
         cv_preds_g=cv_preds_train, ct_w_g=ct_w_train, disp_scale_g=disp_scale_train,
         X_test=X_test, R_test=R_test, disp_scale_test=disp_scale_test,
         cv_smooth_g=cv_smooth_train,
-        seed=42, N_AUG=4, n_epochs=100, batch_size=2048,
+        N_AUG=9, n_epochs=150, batch_size=2048,
         hidden=512, dropout=0.3, k_rhit=10.0, lr=1e-3,
     )
 
-    # ── 6. Phase 1: MLP 5-Fold (10K 학습) ───────────────────────────────────
-    log.info("\n=== Phase 1: MLP 기본 학습 ===")
-    oof_1, res_1, fold_1 = train_mlp_5fold(log, "P1", **mlp_kw)
-    log.info(f"\n[v37-Phase1-OOF]  R-Hit={r_hit(oof_1, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(oof_1, true_xyz):.2f}cm")
+    # ── 6. Multi-seed MLP 앙상블 ────────────────────────────────────────────
+    log.info(f"\n=== Multi-seed MLP 앙상블 (seeds={SEEDS}, N_AUG=9, epochs=150) ===")
+    oof_acc      = np.zeros_like(true_xyz, dtype=float)
+    test_res_acc = np.zeros((len(test_data), 3))
 
-    extra_X, extra_y, extra_s = _make_pseudo(fold_1, blend_test + res_1, "P1→P2")
+    for si, seed in enumerate(SEEDS, 1):
+        log.info(f"\n--- Seed {seed} ({si}/{len(SEEDS)}) ---")
+        oof_s, res_s, _ = train_mlp_5fold(log, f"s{seed}", seed=seed, **MLP_KW)
+        oof_acc      += oof_s
+        test_res_acc += res_s
+        log.info(f"  [Seed {seed}] OOF: {r_hit(oof_s, true_xyz):.4f}")
 
-    # ── 7. Phase 2: Pseudo-label 포함 MLP 재학습 ────────────────────────────
-    log.info("\n=== Phase 2: Pseudo-label 포함 MLP 재학습 ===")
-    oof_2, res_2, _ = train_mlp_5fold(
-        log, "P2",
-        extra_X=extra_X, extra_y=extra_y, extra_scale=extra_s,
-        **mlp_kw,
-    )
-    log.info(f"\n[v37-Phase2-OOF]  R-Hit={r_hit(oof_2, true_xyz):.4f}  "
-             f"MeanDist={mean_dist_cm(oof_2, true_xyz):.2f}cm")
+    oof_preds = oof_acc      / len(SEEDS)
+    test_res  = test_res_acc / len(SEEDS)
+    log.info(f"\n[v38-Ensemble-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
-    # ── 8. XGBoost 메타 게이팅 ──────────────────────────────────────────────
+    # ── 7. XGBoost 메타 게이팅 ──────────────────────────────────────────────
     blend_err   = np.linalg.norm(blend_train - true_xyz, axis=1)
-    oof_err     = np.linalg.norm(oof_2       - true_xyz, axis=1)
+    oof_err     = np.linalg.norm(oof_preds   - true_xyz, axis=1)
     gate_labels = (oof_err < blend_err).astype(int)
     log.info(f"\n[Gate] 개선={gate_labels.sum()}개  "
              f"악화={(~gate_labels.astype(bool)).sum()}개  "
              f"개선율={gate_labels.mean()*100:.1f}%")
 
+    _xgb_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     gate_clf = xgb.XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.7,
-        tree_method='hist', random_state=42, n_jobs=-1, verbosity=0,
+        tree_method='hist', device=_xgb_device, random_state=42, n_jobs=-1, verbosity=0,
     )
     gate_clf.fit(X_train, gate_labels)
     gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]
     gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]
 
-    mlp_res_train = oof_2 - blend_train
+    mlp_res_train = oof_preds - blend_train
     oof_gated = blend_train + gate_prob_train[:, None] * mlp_res_train
     log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
-             f"(raw OOF={r_hit(oof_2, true_xyz):.4f})")
+             f"(raw OOF={r_hit(oof_preds, true_xyz):.4f})")
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    run_error_analysis(log, train_data, true_xyz, oof_2,
+    run_error_analysis(log, train_data, true_xyz, oof_preds,
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
     # ── 9. 최종 예측 ─────────────────────────────────────────────────────────
-    final_test = blend_test + gate_prob_test[:, None] * res_2
+    final_test = blend_test + gate_prob_test[:, None] * test_res
 
     # NaN/Inf 체크 → blend로 폴백
     bad_mask = ~np.isfinite(final_test).all(axis=1)
@@ -1441,7 +1432,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_mlp_v37.csv"
+    out_sub = out_dir / "submission_mlp_v38.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)
