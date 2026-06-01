@@ -1,5 +1,105 @@
 # Changelog
 
+## v39 (2026-06-01) — 최종 제출
+
+### 모델
+- v38 구조(MLP 3-seed 앙상블) + **TrajTransformer** 3-seed 앙상블 병행
+- 두 모델의 OOF R-Hit 기반 가중 블렌딩 → XGB 메타 게이팅 적용
+
+### TrajTransformer 아키텍처
+- `vel_proj` Linear(3 → 128) + 학습 가능 위치 임베딩 (trunc_normal init)
+- Pre-LN `TransformerEncoder` (d_model=128, nhead=4, num_layers=4, FFN=512)
+- Global Average Pooling → head Linear(135, 256) + GELU + Linear(256, 64) + Linear(64, 3)
+- 파라미터 수: ~180K
+
+### TTA (Test Time Augmentation)
+- 테스트 추론 시 32회 랜덤 SO(3) 회전 적용 후 원래 프레임으로 역변환해 평균
+- 각 회전 Q에 대해: `res_orig = Q.T @ R_Q.T @ (model(Q·traj) × scale)`
+- 빠른 속력·급선회 구간의 예측 분산 감소 목적
+
+### 변경 사항
+- `TrajTransformer`: 신규 클래스 추가
+- `train_transformer_5fold()`: smooth R-Hit loss + TTA 32회 추론 포함 신규 함수
+- `main()`: Transformer 3-seed 앙상블 → OOF 기반 MLP:TF 가중치 계산 → 블렌딩 → 게이팅
+
+### 결과
+- Dacon Public: **0.6812** (v38 대비 +0.0002↑)
+- **Private: 0.6784 / 219등** (최종 순위)
+
+---
+
+## v38 (2026-05-31)
+
+### 모델
+- v37 구조에서 Pseudo-label 제거, Multi-seed 앙상블 도입
+- MLP(hidden=512) × 3 seed (42/123/456) × 5-Fold + XGB 게이팅
+
+### 변경 사항
+- `main()`: SEEDS=[42,123,456], 각 seed별 OOF 누적 후 평균 → 앙상블 OOF
+- Pseudo-label Phase 제거 (v34에서 포화 확인됐던 방식)
+- N_AUG=9, epochs=150, batch_size=2048 (v37과 동일)
+- `train_mlp_5fold()`: `extra_X/extra_y/extra_scale` 파라미터 사용 안 함
+
+### 결과
+- Seed별 OOF: s42=0.6621 / s123=0.6656 / s456=0.6602
+- 앙상블 OOF: 0.6691, Gated OOF: 0.6702
+- Dacon Public: **0.681** (v37 대비 +0.0038↑, 역대 최고)
+
+---
+
+## v37 (2026-05-31)
+
+### 모델
+- XGBoost 회귀자 → **TrajMLP** (tabular 피처 기반 MLP) 교체
+- smooth R-Hit@1cm loss로 직접 최적화
+- cv_smooth 앵커 + Pseudo-label 2-Phase + XGB 게이팅
+
+### TrajMLP 아키텍처
+- Input BN → Linear(424, 512) + BN + GELU → Linear(512, 512) + BN + GELU + residual → Linear(512, 256) + BN + GELU → Linear(256, 3)
+- Dropout=0.3
+
+### smooth R-Hit Loss
+```python
+loss = -sigmoid(k × (1 - dist_cm)).mean()   # k=10
+```
+1cm 임계값 근처에서 미분 가능한 R-Hit 근사. XGBoost MSE 대비 Q5(빠름) R-Hit 0.349→0.464(+0.115) 대폭 개선.
+
+### 결과
+- OOF: 0.6624 (Gated 0.6680)
+- Dacon Public: **0.6772** (v36 대비 +0.0142↑↑, 역대 최고)
+
+---
+
+## v36 (2026-05-31)
+
+### 주요 변경
+- `make_xgb_features()`: 신규 피처 41개 추가 (383 → 424개)
+  - 3D 비틀림 torsion (8) + 통계 (4)
+  - 예측 불일치도: cv_smooth vs CT (3), cv_smooth vs CA (3), CT vs CA (3)
+  - 절대 위치 abs_pos_last, abs_pos_first (6)
+  - ω 변화율 d_omega (8) + 통계 (3)
+  - 곡률·속력 변동계수 kappa_cv, speed_cv, kappa_last3_std (3)
+
+### 결과
+- Dacon Public: **0.6630** (v32 대비 -0.0028↓ — 비틀림·절대위치 노이즈, 불일치도·dω는 유효)
+
+---
+
+## v32 (2026-05-30)
+
+### 핵심 변경
+- **앵커 교체**: CT 블렌드(0.5369) → **cv_smooth(Kalman CA)(0.5812)**
+- `predict_ca_kf()`: CA 칼만 필터로 스무딩된 속도에서 CV 예측 (cv_smooth)
+- `main()`: blend = cv_smooth_train (CT 블렌드 앵커 완전 폐기)
+- Pseudo-label 2-Phase 유지
+
+### 결과
+- OOF: 0.6180 (Gated 0.6504)
+- Dacon Public: **0.6658** (v31 대비 +0.0128↑↑, 역대 최고)
+- 앵커 교체가 단일 최대 개선 요인
+
+---
+
 ## v23 (2026-05-26)
 
 ### 모델

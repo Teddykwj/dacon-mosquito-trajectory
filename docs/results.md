@@ -39,6 +39,8 @@
 | v35 | 2026-05-31 | XGBoost+LightGBM 앙상블 + Pseudo-label | P2 XGB 0.6152 / LGB 0.6191 → 블렌드 OOF 0.6196 (Gated 0.6528) | **0.6636** | Gated OOF↑(+0.0024) but Dacon↓(-0.0022). LGB 일반화 열세. v32가 여전히 최고 |
 | v36 | 2026-05-31 | v32 + 신규 피처 41개 (비틀림·불일치도·절대위치·dω) | P2 OOF 0.6193 (Gated 0.6531) | **0.6630** | Gated OOF↑(+0.0027) but Dacon↓(-0.0028). 비틀림·절대위치 노이즈. 불일치도·dω는 유효 |
 | v37 | 2026-05-31 | MLP(512) + smooth R-Hit loss + cv_smooth + Pseudo-label + XGB 게이팅 | P2 OOF 0.6624 (Gated 0.6680) | **0.6772** | R-Hit 직접 최적화. Q5 0.349→0.464(+0.115↑↑). 역대 최고 +0.0114↑↑ |
+| v38 | 2026-05-31 | MLP 3-seed × 5-Fold (N_AUG=9, epochs=150, hidden=512) + XGB 게이팅 | OOF 0.6691 (Gated 0.6702) | **0.681** | Pseudo-label 제거, Multi-seed 앙상블 도입. v37 대비 +0.0038↑ |
+| v39 | 2026-06-01 | MLP + TrajTransformer(d=128, 4L) TTA×32 앙상블 + XGB 게이팅 | OOF - | **0.6812 (Private 0.6784)** | **최종 제출. 219등.** Transformer+TTA 추가. v38 대비 +0.0002↑ |
 
 ---
 

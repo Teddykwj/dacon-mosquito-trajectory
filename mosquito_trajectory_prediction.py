@@ -36,7 +36,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(sh)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(log_dir / "v38_log.txt", encoding="utf-8")
+    fh = logging.FileHandler(log_dir / "v39_log.txt", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
@@ -786,7 +786,7 @@ def run_error_analysis(log, train_data, true_xyz, oof_preds,
     df['improvement_vs_blend'] = bl_errs  - errors_cm
 
     # ── 저장 ──────────────────────────────────────────────────────────────────
-    save_path = out_dir / "oof_analysis_v38.csv"
+    save_path = out_dir / "oof_analysis_v39.csv"
     df.to_csv(save_path, index=False)
     log.info(f"\nOOF 분석 저장 → {save_path}")
 
@@ -987,6 +987,36 @@ class TrajGRU(nn.Module):
     def forward(self, vel_seq: torch.Tensor, phys: torch.Tensor) -> torch.Tensor:
         _, h = self.gru(vel_seq)          # h: (1, B, hidden)
         x    = self.drop(h.squeeze(0))   # (B, hidden)
+        return self.head(torch.cat([x, phys], dim=-1))
+
+
+# ── DL: Transformer 모델 (~180K params) ──────────────────────────────────────────
+class TrajTransformer(nn.Module):
+    def __init__(self, d_model: int = 128, nhead: int = 4,
+                 num_layers: int = 4, dropout: float = 0.15):
+        super().__init__()
+        self.vel_proj = nn.Linear(3, d_model)
+        self.pos_emb  = nn.Parameter(torch.zeros(1, 10, d_model))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model + 7, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Linear(64, 3),
+        )
+
+    def forward(self, vel_seq: torch.Tensor, phys: torch.Tensor) -> torch.Tensor:
+        x = self.vel_proj(vel_seq) + self.pos_emb   # (B, 10, d_model)
+        x = self.encoder(x)                          # (B, 10, d_model)
+        x = x.mean(dim=1)                            # global avg pooling (B, d_model)
         return self.head(torch.cat([x, phys], dim=-1))
 
 
@@ -1284,11 +1314,166 @@ def train_mlp_5fold(log, label,
     return oof, test_res_acc / n_folds, test_res_per_fold
 
 
+# ── Transformer 5-Fold 학습 + TTA 추론 ────────────────────────────────────────────
+def train_transformer_5fold(log,
+                             train_data, blend_train, true_xyz,
+                             ct_results_train, disp_scale_train,
+                             test_data, blend_test, ct_results_test, disp_scale_test,
+                             N_AUG: int = 9, n_folds: int = 5,
+                             n_epochs: int = 150, batch_size: int = 2048,
+                             n_tta: int = 32, seed: int = 42,
+                             k_rhit: float = 10.0):
+    """5-Fold TrajTransformer + 3D 회전 증강 + TTA 추론."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    log.info(f"  Transformer device: {device}  N_AUG={N_AUG}  n_tta={n_tta}  epochs={n_epochs}")
+    n   = len(train_data)
+    nt  = len(test_data)
+    rng = np.random.RandomState(seed)
+
+    def _prep(data, ct_res, disp_sc):
+        outs = [prepare_dl_inputs(t, r[0], r[1]) for t, r in zip(data, ct_res)]
+        vel  = np.array([o[0] for o in outs])
+        phy  = np.array([o[1] for o in outs])
+        Rm   = np.array([o[2] for o in outs])
+        vel  = (vel * (DT * HORIZON) / disp_sc[:, None, None]).astype(np.float32)
+        phy2 = phy.copy();  phy2[:, :6] /= disp_sc[:, None]
+        return vel, phy2.astype(np.float32), Rm
+
+    vel_base, phys_base, R_base = _prep(train_data, ct_results_train, disp_scale_train)
+    vel_test, phys_test, R_test = _prep(test_data,  ct_results_test,  disp_scale_test)
+
+    res_base = true_xyz - blend_train
+    tgt_base = (np.einsum('nij,nj->ni', R_base, res_base)
+                / disp_scale_train[:, None]).astype(np.float32)
+
+    all_vel  = [vel_base];  all_phys = [phys_base]
+    all_tgt  = [tgt_base];  all_sc   = [disp_scale_train]
+
+    for _ in range(N_AUG):
+        Q_batch = np.array([_random_rotation(rng) for _ in range(n)])
+        vel_aug = np.zeros_like(vel_base)
+        phy_aug = np.zeros_like(phys_base)
+        tgt_aug = np.zeros((n, 3), dtype=np.float32)
+        for i in range(n):
+            Q  = Q_batch[i]
+            tq = (Q @ train_data[i].T).T
+            cp = Q @ ct_results_train[i][0]
+            vs, ph, Rq = prepare_dl_inputs(tq, cp, ct_results_train[i][1])
+            ds = disp_scale_train[i]
+            vel_aug[i] = (vs * (DT * HORIZON) / ds).astype(np.float32)
+            ph2 = ph.copy();  ph2[:6] /= ds
+            phy_aug[i] = ph2.astype(np.float32)
+            res_Q = Q @ (true_xyz[i] - blend_train[i])
+            tgt_aug[i] = (Rq @ res_Q / ds).astype(np.float32)
+        all_vel.append(vel_aug);  all_phys.append(phy_aug)
+        all_tgt.append(tgt_aug);  all_sc.append(disp_scale_train)
+
+    vel_all = np.concatenate(all_vel,  axis=0)
+    phy_all = np.concatenate(all_phys, axis=0)
+    tgt_all = np.concatenate(all_tgt,  axis=0)
+    sc_all  = np.concatenate(all_sc,   axis=0).astype(np.float32)
+
+    kf           = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    oof_preds    = np.zeros_like(true_xyz)
+    test_res_acc = np.zeros((nt, 3), dtype=np.float64)
+    rng_tta      = np.random.RandomState(seed + 777)
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(range(n)), 1):
+        tr_aug_idx = np.concatenate([tr_idx + n * r for r in range(N_AUG + 1)])
+
+        X_tr  = torch.from_numpy(vel_all[tr_aug_idx]).to(device)
+        P_tr  = torch.from_numpy(phy_all[tr_aug_idx]).to(device)
+        Y_tr  = torch.from_numpy(tgt_all[tr_aug_idx]).to(device)
+        S_tr  = torch.from_numpy(sc_all[tr_aug_idx]).to(device)
+        X_val = torch.from_numpy(vel_base[val_idx]).to(device)
+        P_val = torch.from_numpy(phys_base[val_idx]).to(device)
+
+        torch.manual_seed(seed + fold)
+        model = TrajTransformer().to(device)
+        opt   = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+
+        N_tr      = len(X_tr)
+        best_rhit = 0.0
+        best_state = None
+
+        for epoch in range(n_epochs):
+            model.train()
+            perm = torch.randperm(N_tr, device=device)
+            for i in range(0, N_tr, batch_size):
+                b    = perm[i:i+batch_size]
+                pred = model(X_tr[b], P_tr[b])
+                loss = smooth_rhit_loss(pred, Y_tr[b], S_tr[b], k=k_rhit)
+                opt.zero_grad();  loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+            sched.step()
+
+            if (epoch + 1) % 20 == 0 or epoch == n_epochs - 1:
+                model.eval()
+                with torch.no_grad():
+                    vp = model(X_val, P_val).cpu().numpy()
+                s_v = disp_scale_train[val_idx]
+                vr  = np.einsum('nji,nj->ni', R_base[val_idx], vp * s_v[:, None])
+                vh  = float(np.mean(np.linalg.norm(
+                    blend_train[val_idx] + vr - true_xyz[val_idx], axis=1) < 0.01))
+                if vh > best_rhit:
+                    best_rhit  = vh
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if best_state:
+            model.load_state_dict(best_state)
+        model.eval()
+
+        # OOF (TTA 없이)
+        with torch.no_grad():
+            val_pn = model(X_val, P_val).cpu().numpy()
+        s_v    = disp_scale_train[val_idx]
+        vr_gl  = np.einsum('nji,nj->ni', R_base[val_idx], val_pn * s_v[:, None])
+        oof_preds[val_idx] = blend_train[val_idx] + vr_gl
+        log.info(f"  [TF] Fold {fold}/{n_folds}  "
+                 f"R-Hit={r_hit(oof_preds[val_idx], true_xyz[val_idx]):.4f}  "
+                 f"(best={best_rhit:.4f}  n_tr={len(tr_aug_idx):,})")
+
+        # Test with TTA: n_tta 회전 후 원래 프레임으로 역변환해 평균
+        fold_acc = np.zeros((nt, 3))
+        for ti in range(n_tta):
+            if ti == 0:
+                Vt = torch.from_numpy(vel_test).to(device)
+                Pt = torch.from_numpy(phys_test).to(device)
+                with torch.no_grad():
+                    pr = model(Vt, Pt).cpu().numpy()
+                for i in range(nt):
+                    fold_acc[i] += R_test[i].T @ (pr[i] * disp_scale_test[i])
+            else:
+                Q_b  = np.array([_random_rotation(rng_tta) for _ in range(nt)])
+                tr_  = [(Q_b[i] @ test_data[i].T).T for i in range(nt)]
+                ct_  = [Q_b[i] @ ct_results_test[i][0] for i in range(nt)]
+                oo   = [prepare_dl_inputs(tr_[i], ct_[i], ct_results_test[i][1])
+                        for i in range(nt)]
+                vr_  = np.array([(oo[i][0] * DT * HORIZON / disp_scale_test[i]).astype(np.float32)
+                                 for i in range(nt)])
+                pr_  = np.array([oo[i][1].copy() for i in range(nt)])
+                pr_[:, :6] /= disp_scale_test[:, None]
+                Rr_  = np.array([oo[i][2] for i in range(nt)])
+                Vr = torch.from_numpy(vr_).to(device)
+                Pr = torch.from_numpy(pr_.astype(np.float32)).to(device)
+                with torch.no_grad():
+                    pr2 = model(Vr, Pr).cpu().numpy()
+                for i in range(nt):
+                    res_rg = Rr_[i].T @ (pr2[i] * disp_scale_test[i])
+                    fold_acc[i] += Q_b[i].T @ res_rg   # Q-frame → original frame
+
+        test_res_acc += fold_acc / n_tta
+
+    return oof_preds, test_res_acc / n_folds
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     log = setup_logger()
     log.info("=" * 66)
-    log.info("모기 비행 궤적 예측 v38 (MLP 3-seed 앙상블 + N_AUG=9 + smooth R-Hit + XGB 게이팅)")
+    log.info("모기 비행 궤적 예측 v39 (MLP + Transformer TTA 앙상블 + XGB 게이팅)")
     log.info("=" * 66)
 
     train_ids, train_data = load_dir(TRAIN_DIR)
@@ -1380,10 +1565,43 @@ def main():
     log.info(f"\n[v38-Ensemble-OOF]  R-Hit={r_hit(oof_preds, true_xyz):.4f}  "
              f"MeanDist={mean_dist_cm(oof_preds, true_xyz):.2f}cm")
 
-    # ── 7. XGBoost 메타 게이팅 ──────────────────────────────────────────────
+    # ── 7. Transformer 앙상블 ────────────────────────────────────────────────
+    TF_KW = dict(
+        train_data=train_data, blend_train=blend_train, true_xyz=true_xyz,
+        ct_results_train=ct_results_train, disp_scale_train=disp_scale_train,
+        test_data=test_data, blend_test=blend_test,
+        ct_results_test=ct_results_test, disp_scale_test=disp_scale_test,
+        N_AUG=9, n_epochs=150, batch_size=2048, n_tta=32, k_rhit=10.0,
+    )
+    log.info(f"\n=== Transformer 앙상블 (seeds={SEEDS}, N_AUG=9, TTA=32) ===")
+    tf_oof_acc  = np.zeros_like(true_xyz, dtype=float)
+    tf_test_acc = np.zeros((len(test_data), 3))
+    for si, seed in enumerate(SEEDS, 1):
+        log.info(f"\n--- [TF] Seed {seed} ({si}/{len(SEEDS)}) ---")
+        tf_oof_s, tf_res_s = train_transformer_5fold(log, seed=seed, **TF_KW)
+        tf_oof_acc  += tf_oof_s
+        tf_test_acc += tf_res_s
+        log.info(f"  [TF Seed {seed}] OOF: {r_hit(tf_oof_s, true_xyz):.4f}")
+    tf_oof      = tf_oof_acc  / len(SEEDS)
+    tf_test_res = tf_test_acc / len(SEEDS)
+    log.info(f"\n[TF-Ensemble-OOF]  R-Hit={r_hit(tf_oof, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(tf_oof, true_xyz):.2f}cm")
+
+    # ── 8. MLP + Transformer 가중 블렌딩 ────────────────────────────────────
+    mlp_rhit = r_hit(oof_preds, true_xyz)
+    tf_rhit  = r_hit(tf_oof,    true_xyz)
+    w_mlp    = mlp_rhit / (mlp_rhit + tf_rhit)
+    w_tf     = 1.0 - w_mlp
+    log.info(f"\n[앙상블 가중치]  MLP={w_mlp:.3f}  TF={w_tf:.3f}")
+    ens_oof      = w_mlp * oof_preds + w_tf * tf_oof
+    ens_test_res = w_mlp * test_res  + w_tf * tf_test_res
+    log.info(f"[Ensemble-OOF]  R-Hit={r_hit(ens_oof, true_xyz):.4f}  "
+             f"MeanDist={mean_dist_cm(ens_oof, true_xyz):.2f}cm")
+
+    # ── 9. XGBoost 메타 게이팅 ───────────────────────────────────────────────
     blend_err   = np.linalg.norm(blend_train - true_xyz, axis=1)
-    oof_err     = np.linalg.norm(oof_preds   - true_xyz, axis=1)
-    gate_labels = (oof_err < blend_err).astype(int)
+    ens_err     = np.linalg.norm(ens_oof     - true_xyz, axis=1)
+    gate_labels = (ens_err < blend_err).astype(int)
     log.info(f"\n[Gate] 개선={gate_labels.sum()}개  "
              f"악화={(~gate_labels.astype(bool)).sum()}개  "
              f"개선율={gate_labels.mean()*100:.1f}%")
@@ -1398,19 +1616,19 @@ def main():
     gate_prob_test  = gate_clf.predict_proba(X_test)[:, 1]
     gate_prob_train = gate_clf.predict_proba(X_train)[:, 1]
 
-    mlp_res_train = oof_preds - blend_train
-    oof_gated = blend_train + gate_prob_train[:, None] * mlp_res_train
+    ens_res_train = ens_oof - blend_train
+    oof_gated = blend_train + gate_prob_train[:, None] * ens_res_train
     log.info(f"[OOF-Gated] R-Hit={r_hit(oof_gated, true_xyz):.4f}  "
-             f"(raw OOF={r_hit(oof_preds, true_xyz):.4f})")
+             f"(raw Ens={r_hit(ens_oof, true_xyz):.4f})")
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    run_error_analysis(log, train_data, true_xyz, oof_preds,
+    run_error_analysis(log, train_data, true_xyz, ens_oof,
                        cv_preds_train, blend_train, ct_w_train,
                        train_ids, out_dir)
 
-    # ── 9. 최종 예측 ─────────────────────────────────────────────────────────
-    final_test = blend_test + gate_prob_test[:, None] * test_res
+    # ── 10. 최종 예측 ────────────────────────────────────────────────────────
+    final_test = blend_test + gate_prob_test[:, None] * ens_test_res
 
     # NaN/Inf 체크 → blend로 폴백
     bad_mask = ~np.isfinite(final_test).all(axis=1)
@@ -1432,7 +1650,7 @@ def main():
         sub[col] = sub['id'].map(
             lambda sid, c=ci: pred_map[sid][c] if sid in pred_map else 0.0
         )
-    out_sub = out_dir / "submission_mlp_v38.csv"
+    out_sub = out_dir / "submission_mlp_v39.csv"
     sub.to_csv(out_sub, index=False)
     os.chmod(out_sub, 0o666)
     os.chmod(out_dir, 0o777)

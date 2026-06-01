@@ -1,0 +1,123 @@
+mosquito-1  | 15:03:03  ==================================================================
+mosquito-1  | 15:03:03  모기 비행 궤적 예측 v39 (MLP + Transformer TTA 앙상블 + XGB 게이팅)
+mosquito-1  | 15:03:03  ==================================================================
+mosquito-1  | 15:03:13  Train: 10000개  |  Test: 10000개
+mosquito-1  | 15:03:13  [CV-last]   R-Hit=0.5788  MeanDist=1.29cm
+mosquito-1  | 15:03:14  [CT (피처용)] weight 평균: 0.416
+mosquito-1  | 15:03:14  Kalman 스무딩 계산 중...
+mosquito-1  | 15:03:16  [cv_smooth 앵커] R-Hit=0.5812  MeanDist=1.36cm
+mosquito-1  | 15:03:16  피처 생성 중...
+mosquito-1  | 15:03:30  피처 수: 424
+mosquito-1  | 15:03:30  
+mosquito-1  | === Multi-seed MLP 앙상블 (seeds=[42, 123, 456], N_AUG=9, epochs=150) ===
+mosquito-1  | 15:03:30  
+mosquito-1  | --- Seed 42 (1/3) ---
+mosquito-1  | 15:03:30    MLP device: cuda  hidden=512  epochs=150
+mosquito-1  | 15:04:51    [s42] Fold 1/5  R-Hit=0.6630  (best=0.6615  n_tr=80,000+0pseudo)
+mosquito-1  | 15:05:07    [s42] Fold 2/5  R-Hit=0.6630  (best=0.6645  n_tr=80,000+0pseudo)
+mosquito-1  | 15:05:22    [s42] Fold 3/5  R-Hit=0.6685  (best=0.6680  n_tr=80,000+0pseudo)
+mosquito-1  | 15:05:37    [s42] Fold 4/5  R-Hit=0.6605  (best=0.6620  n_tr=80,000+0pseudo)
+mosquito-1  | 15:05:53    [s42] Fold 5/5  R-Hit=0.6555  (best=0.6560  n_tr=80,000+0pseudo)
+mosquito-1  | 15:05:53    [Seed 42] OOF: 0.6621
+mosquito-1  | 15:05:53  
+mosquito-1  | --- Seed 123 (2/3) ---
+mosquito-1  | 15:05:53    MLP device: cuda  hidden=512  epochs=150
+mosquito-1  | 15:07:13    [s123] Fold 1/5  R-Hit=0.6725  (best=0.6720  n_tr=80,000+0pseudo)
+mosquito-1  | 15:07:31    [s123] Fold 2/5  R-Hit=0.6625  (best=0.6640  n_tr=80,000+0pseudo)
+mosquito-1  | 15:07:51    [s123] Fold 3/5  R-Hit=0.6560  (best=0.6560  n_tr=80,000+0pseudo)
+mosquito-1  | 15:08:08    [s123] Fold 4/5  R-Hit=0.6775  (best=0.6770  n_tr=80,000+0pseudo)
+mosquito-1  | 15:08:23    [s123] Fold 5/5  R-Hit=0.6595  (best=0.6615  n_tr=80,000+0pseudo)
+mosquito-1  | 15:08:23    [Seed 123] OOF: 0.6656
+mosquito-1  | 15:08:23  
+mosquito-1  | --- Seed 456 (3/3) ---
+mosquito-1  | 15:08:23    MLP device: cuda  hidden=512  epochs=150
+mosquito-1  | 15:09:46    [s456] Fold 1/5  R-Hit=0.6700  (best=0.6705  n_tr=80,000+0pseudo)
+mosquito-1  | 15:10:01    [s456] Fold 2/5  R-Hit=0.6490  (best=0.6490  n_tr=80,000+0pseudo)
+mosquito-1  | 15:10:22    [s456] Fold 3/5  R-Hit=0.6545  (best=0.6550  n_tr=80,000+0pseudo)
+mosquito-1  | 15:10:42    [s456] Fold 4/5  R-Hit=0.6660  (best=0.6670  n_tr=80,000+0pseudo)
+mosquito-1  | 15:11:07    [s456] Fold 5/5  R-Hit=0.6615  (best=0.6625  n_tr=80,000+0pseudo)
+mosquito-1  | 15:11:07    [Seed 456] OOF: 0.6602
+mosquito-1  | 15:11:07  
+mosquito-1  | [v38-Ensemble-OOF]  R-Hit=0.6691  MeanDist=1.18cm
+mosquito-1  | 15:11:07  
+mosquito-1  | === Transformer 앙상블 (seeds=[42, 123, 456], N_AUG=9, TTA=32) ===
+mosquito-1  | 15:11:07  
+mosquito-1  | --- [TF] Seed 42 (1/3) ---
+mosquito-1  | 15:11:07    Transformer device: cuda  N_AUG=9  n_tta=32  epochs=150
+mosquito-1  | /app/mosquito_trajectory_prediction.py:1006: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+mosquito-1  |   self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+mosquito-1  | 15:17:09    [TF] Fold 1/5  R-Hit=0.6565  (best=0.6565  n_tr=80,000)
+mosquito-1  | 15:23:24    [TF] Fold 2/5  R-Hit=0.6585  (best=0.6585  n_tr=80,000)
+mosquito-1  | 15:29:40    [TF] Fold 3/5  R-Hit=0.6605  (best=0.6605  n_tr=80,000)
+mosquito-1  | 15:35:56    [TF] Fold 4/5  R-Hit=0.6510  (best=0.6510  n_tr=80,000)
+mosquito-1  | 15:42:11    [TF] Fold 5/5  R-Hit=0.6515  (best=0.6515  n_tr=80,000)
+mosquito-1  | 15:42:29    [TF Seed 42] OOF: 0.6556
+mosquito-1  | 15:42:29  
+mosquito-1  | --- [TF] Seed 123 (2/3) ---
+mosquito-1  | 15:42:29    Transformer device: cuda  N_AUG=9  n_tta=32  epochs=150
+mosquito-1  | 15:48:32    [TF] Fold 1/5  R-Hit=0.6630  (best=0.6630  n_tr=80,000)
+mosquito-1  | 15:54:48    [TF] Fold 2/5  R-Hit=0.6600  (best=0.6600  n_tr=80,000)
+mosquito-1  | 16:01:04    [TF] Fold 3/5  R-Hit=0.6520  (best=0.6520  n_tr=80,000)
+mosquito-1  | 16:07:21    [TF] Fold 4/5  R-Hit=0.6705  (best=0.6705  n_tr=80,000)
+mosquito-1  | 16:13:36    [TF] Fold 5/5  R-Hit=0.6450  (best=0.6450  n_tr=80,000)
+mosquito-1  | 16:13:54    [TF Seed 123] OOF: 0.6581
+mosquito-1  | 16:13:54  
+mosquito-1  | --- [TF] Seed 456 (3/3) ---
+mosquito-1  | 16:13:54    Transformer device: cuda  N_AUG=9  n_tta=32  epochs=150
+mosquito-1  | 16:19:57    [TF] Fold 1/5  R-Hit=0.6695  (best=0.6695  n_tr=80,000)
+mosquito-1  | 16:26:13    [TF] Fold 2/5  R-Hit=0.6445  (best=0.6445  n_tr=80,000)
+mosquito-1  | 16:32:29    [TF] Fold 3/5  R-Hit=0.6525  (best=0.6525  n_tr=80,000)
+mosquito-1  | 16:38:45    [TF] Fold 4/5  R-Hit=0.6585  (best=0.6585  n_tr=80,000)
+mosquito-1  | 16:45:01    [TF] Fold 5/5  R-Hit=0.6635  (best=0.6635  n_tr=80,000)
+mosquito-1  | 16:45:18    [TF Seed 456] OOF: 0.6577
+mosquito-1  | 16:45:18  
+mosquito-1  | [TF-Ensemble-OOF]  R-Hit=0.6630  MeanDist=1.18cm
+mosquito-1  | 16:45:18  
+mosquito-1  | [앙상블 가중치]  MLP=0.502  TF=0.498
+mosquito-1  | 16:45:18  [Ensemble-OOF]  R-Hit=0.6717  MeanDist=1.17cm
+mosquito-1  | 16:45:18  
+mosquito-1  | [Gate] 개선=6672개  악화=3328개  개선율=66.7%
+mosquito-1  | 16:45:19  [OOF-Gated] R-Hit=0.6702  (raw Ens=0.6717)
+mosquito-1  | 16:45:20  
+mosquito-1  | OOF 분석 저장 → output/oof_analysis_v39.csv
+mosquito-1  | 16:45:20  
+mosquito-1  | [에러 분포 (cm)]
+mosquito-1  | 16:45:20    p25=0.37  p50=0.68  p75=1.21  p90=2.47  p95=4.24  p99=8.84
+mosquito-1  | 16:45:20    R-Hit@1cm=0.6717  (mean=1.17cm  max=17.80cm)
+mosquito-1  | 16:45:20  
+mosquito-1  | [속력 구간별 R-Hit]  (speed_last 기준 5분위)
+mosquito-1  | 16:45:20    Q1(느림): R-Hit=0.868  mean_err=0.55cm  n=2000
+mosquito-1  | 16:45:20    Q2: R-Hit=0.771  mean_err=0.87cm  n=2000
+mosquito-1  | 16:45:20    Q3: R-Hit=0.682  mean_err=1.15cm  n=2000
+mosquito-1  | 16:45:20    Q4: R-Hit=0.569  mean_err=1.47cm  n=2000
+mosquito-1  | 16:45:20    Q5(빠름): R-Hit=0.469  mean_err=1.83cm  n=2000
+mosquito-1  | 16:45:20  
+mosquito-1  | [곡률 구간별 R-Hit]  (kappa_last 기준 5분위)
+mosquito-1  | 16:45:20    Q1(직진): R-Hit=0.664  mean_err=1.15cm  n=2000
+mosquito-1  | 16:45:20    Q2: R-Hit=0.684  mean_err=1.17cm  n=2000
+mosquito-1  | 16:45:20    Q3: R-Hit=0.719  mean_err=1.07cm  n=2000
+mosquito-1  | 16:45:20    Q4: R-Hit=0.694  mean_err=1.10cm  n=2000
+mosquito-1  | 16:45:20    Q5(급선회): R-Hit=0.598  mean_err=1.37cm  n=2000
+mosquito-1  | 16:45:20  
+mosquito-1  | [CT weight 구간별 R-Hit]  (선회 강도)
+mosquito-1  | 16:45:20    직진(0~0.1): R-Hit=0.808  mean_err=0.77cm  n=255
+mosquito-1  | 16:45:20    약선회(0.1~0.3): R-Hit=0.764  mean_err=0.90cm  n=4457
+mosquito-1  | 16:45:20    중선회(0.3~0.6): R-Hit=0.654  mean_err=1.22cm  n=2976
+mosquito-1  | 16:45:20    강선회(0.6~1.0): R-Hit=0.501  mean_err=1.67cm  n=2312
+mosquito-1  | 16:45:20  
+mosquito-1  | [속력 추세별 R-Hit]
+mosquito-1  | 16:45:20    감속: R-Hit=0.704  mean_err=1.08cm  n=3334
+mosquito-1  | 16:45:20    등속: R-Hit=0.710  mean_err=1.01cm  n=3333
+mosquito-1  | 16:45:20    가속: R-Hit=0.601  mean_err=1.42cm  n=3333
+mosquito-1  | 16:45:20  
+mosquito-1  | [CV-last 대비]
+mosquito-1  | 16:45:20    개선된 샘플: 5246개 (52.5%)  평균 개선량=0.34cm
+mosquito-1  | 16:45:20    악화된 샘플: 2582개 (25.8%)  평균 악화량=0.23cm
+mosquito-1  | 16:45:20  
+mosquito-1  | [최악 200개 샘플 평균 특성]  (error_cm 기준)
+mosquito-1  | 16:45:20    speed_last=0.94  kappa_last=12.2585  ct_weight=0.523
+mosquito-1  | 16:45:20    straightness=0.778  turn_cos_last=0.882
+mosquito-1  | 16:45:20    전체 대비: speed=0.64  kappa=13.4572  ct_w=0.416
+mosquito-1  | 16:45:20  [최종 예측] 좌표 범위 검증 완료  (blend 기준 ±10cm 이내)
+mosquito-1  | 16:45:20  제출 파일 저장 → output/submission_mlp_v39.csv
+mosquito-1  | 16:45:20  완료
