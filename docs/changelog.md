@@ -85,6 +85,68 @@ loss = -sigmoid(k × (1 - dist_cm)).mean()   # k=10
 
 ---
 
+## v35 (2026-05-31)
+
+### 모델
+- v32 구조(XGBoost + cv_smooth 앵커 + Pseudo-label) + **LightGBM** 앙상블 추가
+
+### 변경 사항
+- `train_group()`: `model_type='lgb'` 분기 추가 — LGBMRegressor 동일 하이퍼파라미터
+- `main()`: XGBoost Phase2 OOF + LGB Phase2 OOF 50:50 블렌딩 후 게이팅
+
+### 결과
+- Phase2 OOF: XGB 0.6152 / LGB 0.6191 → 블렌드 0.6196 (Gated 0.6528)
+- Dacon Public: **0.6636** (v32 대비 -0.0022↓)
+
+### 실패 분석
+- LGB OOF 수치는 XGB보다 높으나 Dacon에서 일반화 열세 (v14와 동일한 패턴 반복)
+- 50:50 블렌딩이 XGBoost 성능 희석
+- v32 단독이 여전히 최고
+
+---
+
+## v34 (2026-05-30)
+
+### 모델
+- v32 구조 + **Phase 3** 추가 (gated pseudo-label)
+
+### 변경 사항
+- `main()`: Phase2 gated 예측 기반 테스트 pseudo-label 재추출 → Phase3 학습
+- Phase3 pseudo-label 선별 기준: gate_prob > 0.7 AND 예측 일관성 기준
+
+### 결과
+- Phase2 OOF 0.6180 → Phase3 OOF 0.6169 (Gated 0.6508)
+- Dacon Public: **0.6658** (v32와 동일 — Phase3 효과 없음)
+
+### 실패 분석
+- Phase3 OOF 소폭 하락(-0.0011): 이미 Phase2에서 pseudo-label이 포화 상태
+- Gated OOF 미세 상승(+0.0004)은 노이즈 수준
+- Pseudo-label 반복 재학습의 한계 확인
+
+---
+
+## v33 (2026-05-30)
+
+### 모델
+- v32 구조 + 이진 게이트 → **소프트 회귀 게이트** 실험
+
+### 변경 사항
+- 기존: `gate_prob` (XGBClassifier 확률) × residual
+- 변경: 최적 혼합 비율 α*를 OOF 기반으로 샘플별 직접 계산
+  - `α* = argmin_α ||blend + α·residual - true||`
+  - 정답이 있는 학습셋에서 α* 계산 후 XGB 회귀자로 테스트 예측
+
+### 결과
+- OOF: 0.6180 (Gated 0.6497 — v32 Gated 0.6504 대비 -0.0007↓)
+- Dacon Public: **0.6648** (v32 대비 -0.0010↓)
+
+### 실패 분석
+- α* 분포: mean=0.61, std=0.42 → 대부분 0 또는 1에 집중 (사실상 이진)
+- R-Hit@1cm는 거리 임계값 지표 → 연속적인 α 최적화보다 이진 게이트가 더 적합
+- v32 이진 게이팅이 우세
+
+---
+
 ## v32 (2026-05-30)
 
 ### 핵심 변경
@@ -97,6 +159,167 @@ loss = -sigmoid(k × (1 - dist_cm)).mean()   # k=10
 - OOF: 0.6180 (Gated 0.6504)
 - Dacon Public: **0.6658** (v31 대비 +0.0128↑↑, 역대 최고)
 - 앵커 교체가 단일 최대 개선 요인
+
+---
+
+## v31 (2026-05-30)
+
+### 모델
+- v30 구조(Pseudo-label 2-Phase) + **Multi-seed(×5)** 앙상블
+
+### 변경 사항
+- `main()`: SEEDS=[42, 7, 123, 456, 999] 5개 seed로 Phase1·Phase2 각각 학습
+- 각 seed의 Phase2 OOF 평균 → 게이팅
+
+### 결과
+- Phase2 OOF: 0.6241 (Gated 0.6418)
+- Dacon Public: **0.6530** (v32 대비 -0.0128↓, v30 대비 -0.0024↓)
+
+### 실패 분석
+- OOF는 +0.0035 상승했으나 Dacon에서 -0.0024 하락 → OOF↑-Dacon↓ 패턴 재현
+- Multi-seed 앙상블이 게이트 캘리브레이션을 흔들어 soft gate 적용 오류 발생
+- seed 다양화로 인한 OOF 분산 감소가 오히려 gate 학습 신호를 왜곡한 것으로 추정
+
+---
+
+## v30 (2026-05-30)
+
+### 모델
+- v19 구조(XGBoost + cv_smooth 앵커) + **Pseudo-label 2-Phase** 재학습
+
+### 변경 사항
+- `main()`: 2-Phase 구조 도입
+  - Phase1: 기본 5-Fold 학습 → OOF per-fold std 계산
+  - Phase2: std 기준 하위 40%(고신뢰) 테스트 샘플을 pseudo-label로 추가 → 재학습
+- `train_group()`: `extra_X/extra_y` 파라미터 추가, per-fold 테스트 잔차 수집 및 반환
+
+### 결과
+- Phase1 OOF 0.6138 → Phase2 OOF 0.6206 (Gated 0.6422)
+- Dacon Public: **0.6554** (v19 대비 +0.0002↑, 역대 최고 타이)
+
+### 분석
+- pseudo-label로 OOF +0.0068 상승, 테스트 분포에 적응 효과 확인
+- 고신뢰 40% 기준: fold간 예측 표준편차 하위 40%
+
+---
+
+## v29 (2026-05-30)
+
+### 모델
+- v19 구조 복귀 + **원호 피팅(Circle Fit)** 앵커·피처 추가 시도
+
+### 변경 사항
+- `predict_circle_fit()`: PCA 투영 + 2D 최소제곱 원 피팅 함수 추가 (n_pts=6)
+- `make_xgb_features()`: `cf_pred_L(3), cf_vs_cv_L(3), cf_vs_ct_L(3), cf_weight(1)` 10개 추가 (383→393 피처)
+- CF 앵커 단독 테스트 결과: R-Hit=0.0105 (실패)
+
+### 결과
+- OOF: 0.6166 (Gated 0.6385)
+- Dacon Public: **0.6508** (v19 대비 -0.0044↓)
+
+### 실패 분석
+- 6개 점으로 원호 피팅 시 노이즈에 극히 민감 → CF 앵커 단독 R-Hit=0.0105 (CV 0.5788 대비 사실상 무의미)
+- 피처로 추가해도 OOF·Dacon 모두 v19보다 낮음 → 정보 노이즈로 작용
+
+---
+
+## v28 (2026-05-28)
+
+### 모델
+- v27 GRU 모델 스케일 확장
+
+### 변경 사항
+- `TrajGRU`: hidden 32→**128**, head `Linear(hidden+7, 64)`→`Linear(hidden+7, 128)` (~68K params)
+- `train_gru_5fold()`: N_AUG 9→**19** (~200K 증강 샘플)
+
+### 결과
+- Dacon Public: **0.6428** (v27 대비 +0.0088↑)
+- XGBoost v19(0.6552) 대비 -0.0124↓
+
+### 분석
+- 모델 용량 증가는 유효 — hidden=32(5K)는 명백히 과소적합이었음
+- 그러나 GRU 구조 자체가 XGBoost 대비 열세
+- 10K 데이터 환경에서 explicit 물리 피처 377개 > raw sequence 모델
+
+---
+
+## v27 (2026-05-26)
+
+### 모델
+- XGBoost 제거, **TrajGRU** (초소형) 도입 첫 시도
+
+### 변경 사항
+- `TrajGRU`: GRU(3→32, 1layer) + head Linear(32+7, 64)+Linear(64, 3) (~5K params)
+- `train_gru_5fold()`: 5-Fold + N_AUG=9, 100 epochs, batch=512
+- 입력: 속력 기반 정규화 velocity sequence(10,3) + 물리 피처(7)
+- 손실: MSELoss
+
+### 결과
+- Dacon Public: **0.634** (v19 XGBoost 0.6552 대비 -0.021↓)
+
+### 실패 분석
+- hidden=32 → 파라미터 5K: 명백한 과소적합
+- 10K 샘플에서 explicit 물리 피처 기반 XGBoost가 sequence 모델보다 강건
+- v28에서 hidden=128로 확장
+
+---
+
+## v26 (2026-05-26)
+
+### 모델
+- v25 구조(XGBoost + CT 블렌드 앵커) + CT 모델 안정화 + speed-trend 내부 블렌드
+
+### 변경 사항
+- `predict_ct()`: ω 단일 프레임 → **마지막 3프레임 평균**으로 안정화
+- `_speed_trend_inner()`: 접선 가속도 보정 CV (`cv_trend = cv + 0.5·a_t·dt²`) — trend_w ∈ [0, 0.4]
+- `batch_physics_blend()`: speed-trend inner + CT 2-layer 블렌드로 교체
+
+### 결과
+- OOF: 0.6160 (Gated 0.6396)
+- Dacon Public: **0.6536** (v25 대비 -0.0008↓)
+
+### 실패 분석
+- 강선회 OOF +0.025 상승했으나 Dacon에서 하락 → OOF↑-Dacon↓ 패턴 7연속
+- ω 3프레임 평균으로 안정화됐지만 앵커 구조 자체의 한계
+
+---
+
+## v25 (2026-05-26)
+
+### 모델
+- v24 실패 후 **v19 구조 복귀** + cv_smooth 피처만 보존
+
+### 변경 사항
+- `main()`: CA 앵커 제거, CT 블렌드 앵커 복원 (v19 수준)
+- `make_xgb_features()`: cv_smooth 관련 6개 피처 유지 (`cv_smooth_L, cv_smooth_vs_raw_L`)
+
+### 결과
+- OOF: 0.6148 (Gated 0.6378)
+- Dacon Public: **0.6544** (v19 대비 -0.0008↓)
+
+### 분석
+- cv_smooth 피처 자체는 유효한 정보를 담고 있음
+- 앵커로 쓰는 것(v24)은 실패, 피처로 활용하는 것은 소폭 유효
+
+---
+
+## v24 (2026-05-26)
+
+### 모델
+- v19 구조 + **Kalman CA 앵커** 추가 → CV + CT + CA 3-way 블렌드
+
+### 변경 사항
+- `predict_ca_kf()`: CA 칼만 필터 앵커 — 접선 가속도 기반 CA 예측 + cv_smooth 출력
+- `make_xgb_features()`: ca_kf_pred(3), ca_kf_vs_cv(3), cv_smooth_L(3), cv_smooth_vs_raw_L(3) 10개 추가
+- `main()`: blend = CV + CT + CA 3-way 가중 합산
+
+### 결과
+- OOF: 0.6138 (Gated 0.6405)
+- Dacon Public: **0.6536** (v19 대비 -0.0016↓)
+
+### 실패 분석
+- CA-KF 앵커 단독 R-Hit: 0.3968 (CV 0.5788보다 훨씬 낮음) — 앵커로 부적합
+- 그러나 cv_smooth 피처(6개)는 XGBoost에서 유효 → v25에서 피처만 유지
 
 ---
 
@@ -498,6 +721,45 @@ loss = -sigmoid(k × (1 - dist_cm)).mean()   # k=10
 
 ### 결과
 - Dacon Public: 0.6044 (v5 대비 +0.0012, v3 XGBoost 0.6090 미달)
+
+---
+
+## v5 (2026-05-17)
+
+### 모델
+- v4 BiLSTM 구조 유지 + 글로벌 피처 확장
+
+### 변경 사항
+- `make_global_features()`: 15 → 18개 (turn_cos 통계, 속력 기울기 추가)
+- 시퀀스 입력 정규화 추가 시도
+
+### 결과
+- Dacon Public: **0.6032** (v4 대비 -0.0006↓)
+
+### 실패 분석
+- FE 강화에도 BiLSTM이 XGBoost v3(0.6090) 대비 열세 지속
+- 10K 샘플 환경에서 시퀀스 모델의 한계 확인 → v6에서 추가 피처 강화 후 포기
+
+---
+
+## v4 (2026-05-17)
+
+### 모델
+- XGBoost 잔차학습(v3) → **LSTM 잔차학습** 교체 시도
+
+### 변경 사항
+- `TrajectoryLSTM`: LSTM(hidden=128, 2layer) + FC(128→3)
+- 입력: 속도 시계열(10, 3) + 글로벌 피처(15개) concat
+- 타깃: v3와 동일 (true_xyz - cv_last)
+- Adam optimizer, MSELoss, 50 epochs
+
+### 결과
+- Dacon Public: **0.6038** (v3 XGBoost 0.6090 대비 -0.0052↓)
+
+### 실패 분석
+- 10,000개 샘플에서 XGBoost가 LSTM보다 강건
+- 명시적 물리 피처(속력·곡률·회전 정보)를 XGBoost가 더 효율적으로 활용
+- LSTM은 raw 시퀀스에서 이 정보를 스스로 추출해야 하므로 학습 데이터가 적을 때 불리
 
 ---
 
