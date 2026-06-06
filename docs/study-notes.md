@@ -41,6 +41,14 @@ HORIZON = 2     # 예측 대상까지 2스텝 = 80ms
         CV-last 예측 + XGBoost 보정값
 ```
 
+**v39 최종 구조** (§21 참조)
+
+```
+관측 궤적 → Kalman CA → cv_smooth (앵커)
+         → 피처 424개 → [MLP ×3seed + Transformer ×3seed + TTA]
+                      → 가중 블렌딩 → XGB 게이팅 → 최종 예측
+```
+
 ---
 
 ## 4. CV-last — 베이스라인
@@ -112,9 +120,9 @@ R  = [e1, e2, e3]
 
 ---
 
-## 7. 피처 364개 — make_xgb_features
+## 7. 피처 364개 → 424개 — make_xgb_features
 
-궤적 하나 → 364개 숫자 벡터로 변환.
+궤적 하나 → 숫자 벡터로 변환. (v36에서 383→424개로 확장)
 
 | 그룹 | 피처 | 의미 |
 |------|------|------|
@@ -124,9 +132,11 @@ R  = [e1, e2, e3]
 | 물리 파생 | a_t, a_n, ω | 접선가속도·법선가속도·각속도 |
 | 다항식 외삽 | quad, cubic + RMSE | 2차·3차 곡선 피팅 후 예측 |
 | 부호 곡률 | kappa_xy_s, kappa_xz_s | 선회 방향(좌/우, 상/하) |
+| CT·CA 물리 앵커 | ct_pred_L, cv_smooth_L 등 | 물리 예측값과 차이 (§15·§16 참조) |
+| v36 신규 | torsion, d_omega, 불일치도, 절대위치 | 3D 비틀림, ω 변화율, 앵커 간 불일치 |
 | 요약 통계 | mean/std/trend 등 | 각 시계열의 전체 패턴 요약 |
 
-**`make_feature_names`:** 위 364개 피처 각각의 이름 문자열 리스트. 피처 중요도 CSV에 이름으로 저장하기 위해 사용.
+**`make_feature_names`:** 위 피처 각각의 이름 문자열 리스트. 피처 중요도 CSV에 이름으로 저장하기 위해 사용.
 
 ---
 
@@ -232,7 +242,7 @@ train = 원본(val 제외) + 증강 4벌(val 원본의 증강본도 제외)
 
 ---
 
-## 13. 물리 블렌드 앵커 (CV + CT 혼합)
+## 12. 물리 블렌드 앵커 (CV + CT 혼합)
 
 XGBoost의 기준점. 두 물리 모델을 선회 강도에 따라 가중 합산한다.
 
@@ -269,7 +279,7 @@ XGBoost는 `true_xyz - blend` 잔차를 학습하고, 최종 예측은 `blend + 
 
 ---
 
-## 14. 메타 게이팅 (v19)
+## 13. 메타 게이팅 (v19)
 
 ### 핵심 문제
 
@@ -322,7 +332,7 @@ OOF-Gated(0.6360) < Dacon(0.6552) → 테스트에서 더 잘 일반화됨. 게�
 
 ---
 
-## 12. main() 흐름 (v15 최신)
+## 14. main() 흐름 (v15 기준)
 
 ```
 ① 데이터 로드
@@ -344,4 +354,187 @@ OOF-Gated(0.6360) < Dacon(0.6552) → 테스트에서 더 잘 일반화됨. 게�
 
 ⑥ 피처 중요도 저장 + 제출 파일 생성
    final_test = blend_test + (5개 모델 예측 평균)
+```
+
+---
+
+## 15. Kalman CA 앵커 — cv_smooth (v32~)
+
+**문제:** CT 블렌드(0.537)를 앵커로 쓰면 OOF↑-Dacon↓ 패턴이 7연속 발생.
+
+**해결:** CA(등가속도) 칼만 필터로 11개 관측점을 스무딩해 추정한 속도로 CV 예측.
+
+```python
+# _kalman_last_state(): 상태벡터 [pos, vel, acc] forward 필터링
+smooth_pos, smooth_vel, smooth_acc = _kalman_last_state(traj)
+
+cv_smooth = smooth_pos + smooth_vel * DT * HORIZON   # 스무딩 속도 기반 CV
+```
+
+마지막 2프레임 속도 대신 11프레임 전체를 칼만으로 평활화한 속도를 사용 → 노이즈에 강건.
+
+| 앵커 | R-Hit |
+|------|-------|
+| CT 블렌드 | 0.537 |
+| CV-last | 0.579 |
+| **cv_smooth** | **0.581** |
+
+v32에서 앵커를 cv_smooth로 교체하자 OOF와 Dacon이 동시에 상승 (+0.013). **단일 최대 개선.**
+
+---
+
+## 16. 속력 기반 잔차 정규화 (v17~)
+
+**문제:** 빠른 모기(잔차 크기 大)와 느린 모기(잔차 크기 小)의 학습 신호 스케일이 달라 모델이 느린 샘플에 편향됨.
+
+**해결:** 잔차를 `disp_scale = speed_last × DT × HORIZON` 으로 나눠 무차원 비율로 변환.
+
+```python
+disp_scale = np.maximum(speed_last * DT * HORIZON, 0.01)   # 최소 1cm
+
+# 학습 타깃 정규화
+res_local_norm = (R @ (true - anchor)) / disp_scale
+
+# 예측 후 역정규화
+pred_global = R.T @ (pred_norm * disp_scale)
+```
+
+회전 증강 시 속력 크기가 불변이므로 `disp_scale`을 증강 샘플에 그대로 재사용할 수 있다.
+
+---
+
+## 17. smooth R-Hit Loss (v37~)
+
+**문제:** MSELoss는 오차 크기를 최소화하지만 평가 지표인 R-Hit@1cm는 임계값 이하 비율을 최대화한다. 두 목표가 불일치.
+
+**해결:** 1cm 임계값 근처에서 미분 가능한 시그모이드 근사.
+
+```python
+def smooth_rhit_loss(pred_norm, true_norm, disp_scale, k=10.0):
+    diff_cm = norm((pred_norm - true_norm) * disp_scale, dim=1) * 100.0
+    return -sigmoid(k * (1.0 - diff_cm)).mean()
+```
+
+```
+diff_cm = 0cm  → sigmoid(10)  ≈ 1.0  → loss ≈ -1   (최소, 완벽)
+diff_cm = 1cm  → sigmoid(0)   = 0.5  → loss = -0.5  (임계)
+diff_cm = 2cm  → sigmoid(-10) ≈ 0    → loss ≈ 0     (최대, 실패)
+```
+
+k=10이면 1cm 근방 기울기가 충분히 가파르다.
+
+**효과:** MSE 대비 Q5(빠름) R-Hit 0.349→0.464 (+0.115). 임계값에 집중한 손실함수의 효과.
+
+---
+
+## 18. TrajMLP (v37~)
+
+tabular 피처 424개를 입력받아 정규화된 잔차를 예측하는 MLP.
+
+```
+Input BN (424)
+  → Linear(424, 512) + BN + GELU + Dropout(0.3)
+  → Linear(512, 512) + BN + GELU + Dropout(0.3)  ↑ residual 연결
+  → Linear(512, 256) + BN + GELU + Dropout(0.3)
+  → Linear(256, 3)
+```
+
+- **Residual 연결**: 두 번째 레이어 입력+출력을 더함 → 기울기 흐름 안정
+- **Input BN**: 속도·곡률 등 단위가 다른 피처를 정규화
+- **학습**: AdamW + CosineAnnealingLR, best checkpoint (val R-Hit 기준)
+- **Multi-seed ×3**: seed 42/123/456 앙상블로 분산 감소
+
+---
+
+## 19. TrajTransformer + TTA (v39~)
+
+raw velocity sequence(10, 3)를 직접 인코딩하는 Transformer 모델.
+
+### 아키텍처
+
+```
+vel_seq (B, 10, 3)
+  → Linear(3, 128) + 학습 가능 위치 임베딩(1, 10, 128)
+  → TransformerEncoder ×4 레이어
+      (d_model=128, nhead=4, FFN=512, Pre-LN, Dropout=0.15)
+  → Global Average Pooling  →  (B, 128)
+  → concat phys(7)          →  (B, 135)
+  → Linear(135, 256) + GELU + Linear(256, 64) + GELU + Linear(64, 3)
+```
+
+TrajMLP(tabular 피처)와 상호 보완: MLP는 명시적 물리 피처, Transformer는 raw sequence에서 패턴을 직접 학습.
+
+### TTA (Test Time Augmentation)
+
+추론 시 테스트 샘플마다 32회 랜덤 회전을 적용해 예측한 뒤 원래 좌표계로 역변환해 평균.
+
+```python
+# 회전 Q 적용 후 예측 → 역변환
+res_rg   = R_Q.T @ (model(Q·traj) * disp_scale)   # Q좌표계 잔차
+res_orig = Q.T @ res_rg                             # 원래 좌표계로 복원
+
+# 32회 평균
+fold_acc += res_orig   # 누적 후 / n_tta
+```
+
+TTA 수학적 근거: 앵커(cv_smooth)는 Q에 무관하므로 `Q.T @ Q @ anchor = anchor`. 잔차 부분만 역변환하면 된다.
+
+**효과:** 단일 방향 예측의 분산 감소. 특히 빠른 속력·급선회처럼 예측이 불안정한 구간에 유효.
+
+---
+
+## 20. Pseudo-label (v30~v34)
+
+**핵심 아이디어:** 테스트 데이터를 가짜 정답(pseudo-label)으로 활용해 모델을 재학습.
+
+```
+Phase1: 기본 5-Fold 학습 → 각 Fold별 test 잔차 예측 분산 계산
+Phase2: fold간 std 하위 40% (고신뢰) 테스트 샘플을 pseudo-label로 추가 → 재학습
+```
+
+**고신뢰 기준:** 5개 fold 예측의 표준편차가 낮을수록 예측이 일관됨 → 정답에 가까울 가능성이 높음.
+
+**효과와 한계:**
+- Phase2 OOF: +0.0068 (v30)
+- Phase3 이상은 포화 상태 (v34에서 확인)
+- v37 MLP+smooth loss 도입 후 pseudo-label 없이도 성능 초과 → 폐기
+
+---
+
+## 21. main() 흐름 (v39 최종)
+
+```
+① 데이터 로드
+   train_data (10000, 11, 3) + true_xyz (10000, 3)
+
+② 앵커 계산
+   cv_smooth = Kalman CA 스무딩 속도 기반 CV  (R-Hit=0.5812)
+
+③ CT 결과 계산 (피처 입력용)
+   ct_pred, ct_weight → make_xgb_features() 에서 활용
+
+④ 피처 생성
+   X_train (10000, 424)  R_train (10000, 3, 3)
+
+⑤ Multi-seed MLP 앙상블  [seeds=42/123/456]
+   각 seed: 5-Fold × N_AUG=9 × smooth R-Hit loss
+   → mlp_oof (10000, 3),  mlp_test_res (10000, 3)
+
+⑥ Multi-seed Transformer 앙상블  [seeds=42/123/456]
+   각 seed: 5-Fold × N_AUG=9 × smooth R-Hit loss + TTA×32
+   → tf_oof (10000, 3),  tf_test_res (10000, 3)
+
+⑦ OOF R-Hit 기반 가중 블렌딩
+   w_mlp = mlp_rhit / (mlp_rhit + tf_rhit)
+   ens_oof      = w_mlp × mlp_oof  + w_tf × tf_oof
+   ens_test_res = w_mlp × mlp_test + w_tf × tf_test
+
+⑧ XGB 메타 게이팅
+   gate_labels  = (ens_oof_err < anchor_err)
+   gate_prob    = XGBClassifier.predict_proba(X_test)[:, 1]
+
+⑨ 최종 예측
+   final = cv_smooth_test + gate_prob × ens_test_res
+   → NaN/Inf → anchor 폴백
+   → ±10cm 클리핑
 ```
